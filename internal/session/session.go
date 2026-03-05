@@ -26,12 +26,12 @@ type Message struct {
 
 // Session represents a conversation session.
 type Session struct {
-	Key             string                 `json:"key"`
-	Messages        []Message              `json:"messages"`
-	CreatedAt       time.Time              `json:"created_at"`
-	UpdatedAt       time.Time              `json:"updated_at"`
-	Metadata        map[string]interface{} `json:"metadata,omitempty"`
-	LastConsolidated int                   `json:"last_consolidated"`
+	Key              string                 `json:"key"`
+	Messages         []Message              `json:"messages"`
+	CreatedAt        time.Time              `json:"created_at"`
+	UpdatedAt        time.Time              `json:"updated_at"`
+	Metadata         map[string]interface{} `json:"metadata,omitempty"`
+	LastConsolidated int                    `json:"last_consolidated"`
 }
 
 // New returns a new empty session.
@@ -98,6 +98,21 @@ func WithMeta(meta map[string]interface{}) MessageOption {
 	return func(m *Message) { m.Meta = meta }
 }
 
+// WithToolCalls sets assistant tool_calls payload.
+func WithToolCalls(calls interface{}) MessageOption {
+	return func(m *Message) { m.ToolCalls = calls }
+}
+
+// WithToolCallID sets tool_call_id for tool messages.
+func WithToolCallID(id string) MessageOption {
+	return func(m *Message) { m.ToolCallID = id }
+}
+
+// WithName sets optional name field.
+func WithName(name string) MessageOption {
+	return func(m *Message) { m.Name = name }
+}
+
 // Manager handles session storage and caching.
 type Manager struct {
 	dir       string
@@ -162,11 +177,11 @@ func (m *Manager) Save(s Session) error {
 	defer f.Close()
 
 	metaLine := map[string]interface{}{
-		"_type":           "metadata",
-		"key":             s.Key,
-		"created_at":      s.CreatedAt,
-		"updated_at":      s.UpdatedAt,
-		"metadata":        s.Metadata,
+		"_type":             "metadata",
+		"key":               s.Key,
+		"created_at":        s.CreatedAt,
+		"updated_at":        s.UpdatedAt,
+		"metadata":          s.Metadata,
 		"last_consolidated": s.LastConsolidated,
 	}
 	if err := writeJSONL(f, metaLine); err != nil {
@@ -230,9 +245,9 @@ func (m *Manager) loadFromPath(path string) (Session, error) {
 	defer f.Close()
 
 	var (
-		messages        []Message
-		metadata        map[string]interface{}
-		created time.Time
+		messages []Message
+		metadata map[string]interface{}
+		created  time.Time
 		lastCons int
 	)
 

@@ -42,6 +42,27 @@ func TestRestrictPreventsEscape(t *testing.T) {
 	}
 }
 
+func TestRestrictPreventsListEscape(t *testing.T) {
+	tmp := t.TempDir()
+	list := ListDirTool{Workspace: tmp, Restrict: true}
+	_, err := list.Execute(context.Background(), map[string]interface{}{"path": "/etc"})
+	if err == nil {
+		t.Fatalf("expected restriction error")
+	}
+}
+
+func TestRestrictPreventsWriteEscape(t *testing.T) {
+	tmp := t.TempDir()
+	write := WriteFileTool{Workspace: tmp, Restrict: true}
+	_, err := write.Execute(context.Background(), map[string]interface{}{
+		"path":    "/tmp/outside.txt",
+		"content": "x",
+	})
+	if err == nil {
+		t.Fatalf("expected restriction error")
+	}
+}
+
 func TestResolveHomePath(t *testing.T) {
 	tmp := t.TempDir()
 	homeFile := filepath.Join(tmp, "b.txt")

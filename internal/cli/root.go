@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/huhuhudia/lobster-go/internal/heartbeat"
 	"github.com/huhuhudia/lobster-go/internal/providers"
 	"github.com/huhuhudia/lobster-go/internal/session"
+	"github.com/huhuhudia/lobster-go/internal/templates"
 	"github.com/huhuhudia/lobster-go/internal/version"
 )
 
@@ -72,19 +74,54 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  lobster-go help       Show this help")
 }
 
+func loadConfigOrDefault(stderr io.Writer) config.Config {
+	cfg, err := config.Load("")
+	if err != nil {
+		fmt.Fprintf(stderr, "warning: load config failed, using defaults: %v\n", err)
+		return config.DefaultConfig()
+	}
+	return cfg
+}
+
+func agentLoopConfigFromConfig(cfg config.Config, workspace string) agent.LoopConfig {
+	timeoutSec := cfg.Tools.ExecTimeoutSec
+	if timeoutSec <= 0 {
+		timeoutSec = config.DefaultConfig().Tools.ExecTimeoutSec
+	}
+	return agent.LoopConfig{
+		Model:                  cfg.Agents.Defaults.Model,
+		Temperature:            cfg.Agents.Defaults.Temperature,
+		MaxTokens:              cfg.Agents.Defaults.MaxTokens,
+		Workspace:              workspace,
+		RestrictToWorkspace:    cfg.Tools.RestrictToWorkspace,
+		ExecTimeoutSec:         timeoutSec,
+		MemoryConsolidateEvery: cfg.Memory.ConsolidateEvery,
+		MemoryWindowSize:       cfg.Memory.WindowSize,
+		MemoryMode:             cfg.Memory.Mode,
+	}
+}
+
+func durationFromSec(sec int, fallback int) time.Duration {
+	if sec <= 0 {
+		sec = fallback
+	}
+	return time.Duration(sec) * time.Second
+}
+
 func runAgent(stdout, stderr io.Writer) int {
-	cfg, _ := config.Load("")
+	cfg := loadConfigOrDefault(stderr)
 
 	workspace := "."
 	b := bus.New(100)
 	sessions := session.NewManager(workspace)
 	builder := agentctx.Builder{SystemPrompt: "You are lobster-go agent."}
 	prov := providers.BuildProvider(cfg)
-	loop := agent.NewLoop(b, prov, sessions, builder, agent.LoopConfig{ExecTimeoutSec: 30, Workspace: workspace})
-	loop.RegisterTool(tools.ListDirTool{Workspace: workspace})
-	loop.RegisterTool(tools.ReadFileTool{Workspace: workspace, MaxBytes: 4000})
-	loop.RegisterTool(tools.WriteFileTool{Workspace: workspace})
-	loop.RegisterTool(tools.ExecTool{Workspace: workspace, TimeoutSec: 30})
+	loopCfg := agentLoopConfigFromConfig(cfg, workspace)
+	loop := agent.NewLoop(b, prov, sessions, builder, loopCfg)
+	loop.RegisterTool(tools.ListDirTool{Workspace: workspace, Restrict: loopCfg.RestrictToWorkspace})
+	loop.RegisterTool(tools.ReadFileTool{Workspace: workspace, Restrict: loopCfg.RestrictToWorkspace, MaxBytes: 4000})
+	loop.RegisterTool(tools.WriteFileTool{Workspace: workspace, Restrict: loopCfg.RestrictToWorkspace})
+	loop.RegisterTool(tools.ExecTool{Workspace: workspace, Restrict: loopCfg.RestrictToWorkspace, TimeoutSec: loopCfg.ExecTimeoutSec})
 	loop.RegisterTool(tools.WebSearchTool{})
 	loop.RegisterTool(tools.WebFetchTool{TimeoutSec: 10})
 	loop.RegisterTool(tools.MessageTool{Bus: b})
@@ -93,7 +130,17 @@ func runAgent(stdout, stderr io.Writer) int {
 	defer cancel()
 	go loop.Run(ctx)
 
-	fmt.Fprintln(stdout, "agent running (stub). Type and press Enter to chat. Press Ctrl+C to exit.")
+	if shouldUseTUI(stdout) {
+		return runAgentTUI(ctx, cancel, b, cfg, stdout, stderr)
+	}
+	logAgentConfig(stdout, cfg)
+	return runAgentLineUI(ctx, cancel, b, stdout)
+}
+
+func runAgentLineUI(ctx context.Context, cancel context.CancelFunc, b *bus.MessageBus, stdout io.Writer) int {
+	ui := newAgentUI(stdout)
+	ui.RenderHeader()
+	ui.System("agent running. Type and press Enter to chat. Ctrl+C or /exit to quit.")
 
 	// Outbound printer for cli channel
 	go func() {
@@ -110,7 +157,7 @@ func runAgent(stdout, stderr io.Writer) int {
 			if msg.Channel != "cli" {
 				continue
 			}
-			fmt.Fprintf(stdout, "agent: %s\n", msg.Content)
+			ui.Assistant(msg.Content)
 		}
 	}()
 
@@ -118,16 +165,37 @@ func runAgent(stdout, stderr io.Writer) int {
 	if os.Getenv("LOBSTER_AGENT_EXIT_AFTER_MS") == "" {
 		go func() {
 			scanner := bufio.NewScanner(os.Stdin)
-			for scanner.Scan() {
+			for {
 				select {
 				case <-ctx.Done():
 					return
 				default:
 				}
+				ui.Prompt()
+				if !scanner.Scan() {
+					ui.InputSubmitted()
+					cancel()
+					return
+				}
+				ui.InputSubmitted()
 				text := strings.TrimSpace(scanner.Text())
 				if text == "" {
 					continue
 				}
+				switch strings.ToLower(text) {
+				case "/help":
+					ui.System("commands: /help  /clear  /exit")
+					continue
+				case "/clear":
+					ui.Clear()
+					ui.RenderHeader()
+					continue
+				case "/exit", "/quit":
+					ui.System("bye")
+					cancel()
+					return
+				}
+				ui.System("thinking...")
 				_ = b.PublishInbound(bus.InboundMessage{
 					Channel: "cli",
 					ChatID:  "console",
@@ -161,6 +229,160 @@ func runAgent(stdout, stderr io.Writer) int {
 	case <-ctx.Done():
 		return 0
 	}
+}
+
+func shouldUseTUI(stdout io.Writer) bool {
+	if os.Getenv("LOBSTER_DISABLE_TUI") == "1" {
+		return false
+	}
+	if os.Getenv("LOBSTER_AGENT_EXIT_AFTER_MS") != "" {
+		return false
+	}
+	if stdout != os.Stdout {
+		return false
+	}
+	term := strings.TrimSpace(os.Getenv("TERM"))
+	if term == "" || term == "dumb" {
+		return false
+	}
+	if fi, err := os.Stdin.Stat(); err != nil || (fi.Mode()&os.ModeCharDevice) == 0 {
+		return false
+	}
+	return true
+}
+
+type agentUI struct {
+	out         io.Writer
+	mu          sync.Mutex
+	useColor    bool
+	promptShown bool
+}
+
+func newAgentUI(out io.Writer) *agentUI {
+	term := strings.TrimSpace(os.Getenv("TERM"))
+	useColor := term != "" && term != "dumb"
+	return &agentUI{out: out, useColor: useColor}
+}
+
+func (u *agentUI) RenderHeader() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	fmt.Fprintln(u.out, "+---------------------------------------------------+")
+	fmt.Fprintln(u.out, "| lobster-go interactive shell                      |")
+	fmt.Fprintln(u.out, "| commands: /help /clear /exit                      |")
+	fmt.Fprintln(u.out, "+---------------------------------------------------+")
+}
+
+func (u *agentUI) Prompt() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	fmt.Fprint(u.out, u.promptPrefix())
+	u.promptShown = true
+}
+
+func (u *agentUI) InputSubmitted() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.promptShown = false
+}
+
+func (u *agentUI) Assistant(text string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.beginMessage()
+	fmt.Fprintf(u.out, "%s%s\n", u.color("ai  > ", "36"), text)
+	u.restorePromptIfNeeded()
+}
+
+func (u *agentUI) System(text string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.beginMessage()
+	fmt.Fprintf(u.out, "%s%s\n", u.color("sys > ", "33"), text)
+	u.restorePromptIfNeeded()
+}
+
+func (u *agentUI) Clear() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	fmt.Fprint(u.out, "\033[2J\033[H")
+}
+
+func (u *agentUI) color(s, code string) string {
+	if !u.useColor {
+		return s
+	}
+	return "\033[" + code + "m" + s + "\033[0m"
+}
+
+func (u *agentUI) promptPrefix() string {
+	return u.color("you > ", "32")
+}
+
+func (u *agentUI) beginMessage() {
+	if u.promptShown {
+		fmt.Fprint(u.out, "\n")
+	}
+}
+
+func (u *agentUI) restorePromptIfNeeded() {
+	if u.promptShown {
+		fmt.Fprint(u.out, u.promptPrefix())
+	}
+}
+
+func logAgentConfig(stdout io.Writer, cfg config.Config) {
+	providerName := strings.TrimSpace(cfg.Agents.Defaults.Provider)
+	if providerName == "" {
+		if _, ok := cfg.Providers["openai"]; ok {
+			providerName = "openai"
+		} else {
+			providerName = "(auto)"
+		}
+	}
+
+	model := strings.TrimSpace(cfg.Agents.Defaults.Model)
+	if model == "" && providerName != "(auto)" {
+		if p, ok := cfg.Providers[providerName]; ok {
+			model = p.Model
+		}
+	}
+	if model == "" {
+		model = "(default)"
+	}
+
+	baseURL := ""
+	apiKey := ""
+	if p, ok := cfg.Providers[providerName]; ok {
+		baseURL = p.BaseURL
+		apiKey = p.APIKey
+	}
+	if baseURL == "" {
+		baseURL = "(default)"
+	}
+	if apiKey == "" {
+		apiKey = "(empty)"
+	} else {
+		apiKey = formatAPIKeyForLog(apiKey)
+	}
+
+	fmt.Fprintf(stdout, "config: provider=%s model=%s\n", providerName, model)
+	fmt.Fprintf(stdout, "config: base_url=%s\n", baseURL)
+	fmt.Fprintf(stdout, "config: api_key=%s\n", apiKey)
+}
+
+func formatAPIKeyForLog(key string) string {
+	if os.Getenv("LOBSTER_LOG_FULL_API_KEY") == "1" {
+		return key
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return "(empty)"
+	}
+	if len(key) <= 8 {
+		return "****"
+	}
+	return key[:4] + "..." + key[len(key)-4:]
 }
 
 func runSession(args []string, stdout, stderr io.Writer) int {
@@ -260,29 +482,13 @@ func runOnboard(stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "✓ Created workspace at %s\n", workspace)
 	}
 
-	// Create memory directory
-	memoryDir := filepath.Join(workspace, "memory")
-	if err := os.MkdirAll(memoryDir, 0o755); err != nil {
-		fmt.Fprintf(stderr, "error creating memory directory: %v\n", err)
+	added, err := templates.Sync(workspace)
+	if err != nil {
+		fmt.Fprintf(stderr, "error syncing templates: %v\n", err)
 		return 1
 	}
-
-	// Create default MEMORY.md if not exists
-	memoryFile := filepath.Join(memoryDir, "MEMORY.md")
-	if _, err := os.Stat(memoryFile); os.IsNotExist(err) {
-		defaultMemory := "# Auto Memory\n\nThis file stores persistent memories.\n"
-		if err := os.WriteFile(memoryFile, []byte(defaultMemory), 0o644); err != nil {
-			fmt.Fprintf(stderr, "error creating MEMORY.md: %v\n", err)
-			return 1
-		}
-		fmt.Fprintf(stdout, "✓ Created memory/MEMORY.md\n")
-	}
-
-	// Create history directory
-	historyDir := filepath.Join(workspace, "history")
-	if err := os.MkdirAll(historyDir, 0o755); err != nil {
-		fmt.Fprintf(stderr, "error creating history directory: %v\n", err)
-		return 1
+	for _, name := range added {
+		fmt.Fprintf(stdout, "✓ Created %s\n", name)
 	}
 
 	fmt.Fprintln(stdout, "\n🦞 lobster-go is ready!")
@@ -299,8 +505,11 @@ func runOnboard(stdout, stderr io.Writer) int {
 // ============================================================================
 
 func runCron(args []string, stdout, stderr io.Writer) int {
+	cfg := loadConfigOrDefault(stderr)
+	interval := durationFromSec(cfg.Services.CronIntervalSec, 60)
+
 	if len(args) > 0 && strings.ToLower(args[0]) == "list" {
-		return cronList(stdout, stderr)
+		return cronList(stdout, stderr, interval)
 	}
 
 	// Run cron service
@@ -310,7 +519,7 @@ func runCron(args []string, stdout, stderr io.Writer) int {
 	jobs := []cron.Job{
 		{
 			Name:     "heartbeat",
-			Interval: 60 * time.Second,
+			Interval: interval,
 			Task:     cron.LogTask("heartbeat"),
 		},
 	}
@@ -333,9 +542,9 @@ func runCron(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func cronList(stdout, stderr io.Writer) int {
+func cronList(stdout, stderr io.Writer, interval time.Duration) int {
 	fmt.Fprintln(stdout, "Scheduled jobs:")
-	fmt.Fprintln(stdout, "  heartbeat  - every 60s")
+	fmt.Fprintf(stdout, "  heartbeat  - every %ds\n", int(interval.Seconds()))
 	return 0
 }
 
@@ -345,11 +554,12 @@ func cronList(stdout, stderr io.Writer) int {
 
 func runHeartbeat(stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "Starting heartbeat service...")
+	cfg := loadConfigOrDefault(stderr)
 
 	b := bus.New(100)
 	svc := &heartbeat.Service{
 		Bus:      b,
-		Interval: 30 * time.Second,
+		Interval: durationFromSec(cfg.Services.HeartbeatIntervalSec, 30),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

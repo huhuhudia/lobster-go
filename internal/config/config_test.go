@@ -29,6 +29,21 @@ func TestLoadMissingReturnsDefault(t *testing.T) {
 	if cfg.Tools.ExecTimeoutSec != 120 {
 		t.Fatalf("default ExecTimeoutSec mismatch, got %d", cfg.Tools.ExecTimeoutSec)
 	}
+	if cfg.Services.CronIntervalSec != 60 {
+		t.Fatalf("default CronIntervalSec mismatch, got %d", cfg.Services.CronIntervalSec)
+	}
+	if cfg.Services.HeartbeatIntervalSec != 30 {
+		t.Fatalf("default HeartbeatIntervalSec mismatch, got %d", cfg.Services.HeartbeatIntervalSec)
+	}
+	if cfg.Memory.ConsolidateEvery != 20 {
+		t.Fatalf("default ConsolidateEvery mismatch, got %d", cfg.Memory.ConsolidateEvery)
+	}
+	if cfg.Memory.WindowSize != 50 {
+		t.Fatalf("default WindowSize mismatch, got %d", cfg.Memory.WindowSize)
+	}
+	if cfg.Memory.Mode != "window" {
+		t.Fatalf("default Mode mismatch, got %s", cfg.Memory.Mode)
+	}
 }
 
 func TestLoadSnakeCase(t *testing.T) {
@@ -50,6 +65,15 @@ func TestLoadSnakeCase(t *testing.T) {
 		"tools": {
 			"restrict_to_workspace": true,
 			"exec_timeout_sec": 99
+		},
+		"services": {
+			"cron_interval_sec": 15,
+			"heartbeat_interval_sec": 7
+		},
+		"memory": {
+			"consolidate_every": 3,
+			"window_size": 8,
+			"mode": "archive_all"
 		}
 	}`
 	if err := os.WriteFile(path, []byte(data), 0o644); err != nil {
@@ -70,6 +94,21 @@ func TestLoadSnakeCase(t *testing.T) {
 	}
 	if cfg.Tools.ExecTimeoutSec != 99 {
 		t.Fatalf("exec timeout mismatch: %d", cfg.Tools.ExecTimeoutSec)
+	}
+	if cfg.Services.CronIntervalSec != 15 {
+		t.Fatalf("cron interval mismatch: %d", cfg.Services.CronIntervalSec)
+	}
+	if cfg.Services.HeartbeatIntervalSec != 7 {
+		t.Fatalf("heartbeat interval mismatch: %d", cfg.Services.HeartbeatIntervalSec)
+	}
+	if cfg.Memory.ConsolidateEvery != 3 {
+		t.Fatalf("consolidate_every mismatch: %d", cfg.Memory.ConsolidateEvery)
+	}
+	if cfg.Memory.WindowSize != 8 {
+		t.Fatalf("window_size mismatch: %d", cfg.Memory.WindowSize)
+	}
+	if cfg.Memory.Mode != "archive_all" {
+		t.Fatalf("mode mismatch: %s", cfg.Memory.Mode)
 	}
 }
 

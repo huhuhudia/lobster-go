@@ -1,14 +1,10 @@
 package templates
 
 import (
-	"embed"
 	"fmt"
 	"os"
 	"path/filepath"
 )
-
-//go:embed *.md
-var templateFS embed.FS
 
 // Template files embedded in binary
 var defaultTemplates = map[string]string{

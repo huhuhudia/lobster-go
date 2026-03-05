@@ -58,8 +58,94 @@ test/                           # 集成与端到端用例
 5. HTTP/WebSocket: 使用 net/http 与 gorilla/websocket；邮件可用 go-imap 与 gomail。
 6. LLM: OpenAI 官方 SDK 或自实现 HTTP 客户端，保留 tool call JSON schema，与 nanobot Prompt 模板兼容。
 
+## 本地构建与测试基线
+1. Go 版本基线：`go 1.22`（见 `go.mod`）。
+2. 全量单测：`go test ./...`。
+3. 本地受限环境（如沙箱）可使用：
+`GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod go test ./...`
+4. CLI 基础验收：
+`go run ./cmd/lobster-go version`
+`go run ./cmd/lobster-go help`
+
 ## 风险与开放问题
 1. Matrix、QQ、Feishu、DingTalk Go SDK 的成熟度与维护性需要确认，可能分阶段实现。
 2. WhatsApp 纯 Go 实现依赖第三方库稳定性，短期可继续用现有 Node bridge 以降低风险。
 3. LLM 工具调用在 Go SDK 中的接口支持有限，可能需要自定义函数调用编码/解码。
 4. 多渠道媒体文件传输与富文本格式化差异需逐一适配，测试样例要覆盖边界。
+
+## 下一步工作计划（执行看板）
+1. ✅ 现状审阅与差距确认
+验收标准：完成对现有 md 与核心代码的整体阅读，明确当前已实现能力、未完成能力和主要阻塞点。
+
+2. ✅ 修复 `internal/templates` 编译阻塞
+验收标准：解决 `//go:embed *.md` 无匹配文件导致的编译失败，`go test ./...` 能跑到该包测试阶段。
+
+3. ✅ 对齐 Go 版本与工程基线
+验收标准：确认并统一 `go.mod` 版本（目标 Go 1.22），补充必要的构建与本地测试说明。
+
+4. ✅ 加强 Agent 主循环稳定性
+验收标准：补齐工具调用失败、空回复、多轮 tool call、超时取消等关键路径测试，并修复发现的问题。
+
+5. ✅ 完成模板系统落盘链路
+验收标准：`onboard` 直接复用 `templates.Sync`，保证模板/目录创建幂等，新增对应 CLI 测试。
+
+6. ✅ 打通配置到运行时注入
+验收标准：`agent/cron/heartbeat` 从配置读取关键参数（模型、温度、timeout、restrictToWorkspace），并有覆盖测试。
+
+7. ✅ 增强工具安全策略
+验收标准：`exec` 工具增加命令黑名单与输出截断策略；文件工具在限制模式下补全越界测试。
+
+8. ✅ 扩展渠道层最小可用集
+验收标准：在已有 Feishu 基础上补一个轻量渠道（如 webhook/stdin mock）用于端到端联调，并附测试。
+
+9. ✅ 建立端到端回归用例
+验收标准：新增 e2e 用例覆盖“消息入站 -> tool 调用 -> 回复出站 -> session/memory 落盘”主路径。
+
+10. ✅ 收敛里程碑文档与实际状态
+验收标准：逐项更新本文里程碑状态，已完成项标记 `✅`，并附可复现的测试命令。
+
+## 当前里程碑状态（2026-03-05）
+1. ✅ 里程碑 1（代码骨架与构建链路）
+2. ✅ 里程碑 2（配置系统）
+3. ✅ 里程碑 3（消息总线与事件模型）
+4. ✅ 里程碑 4（Session 与持久化）
+5. ✅ 里程碑 5（Provider 抽象）
+6. ✅ 里程碑 6（AgentLoop 核心，含多 tool call/错误兜底/迭代保护）
+7. ✅ 里程碑 7（工具层，含 exec 安全策略与文件越界测试）
+8. ✅ 里程碑 8（记忆系统）已支持 Provider `save_memory` 工具调用、`archive_all/window` 两种模式、`last_consolidated` 更新、文件校验测试，并接入 AgentLoop 按阈值自动归档。
+9. ⚠️ 里程碑 9（Cron 服务）当前为固定间隔任务模型，尚未实现完整 cron 表达式与去重语义。
+10. ⚠️ 里程碑 10（Heartbeat）已支持定时发布，指标维度仍可扩展。
+11. ✅ 里程碑 11（CLI 交互基础命令）
+12. ⚠️ 里程碑 12（Channels）Feishu + Mock 已落地，其它渠道待补充。
+13. ⬜ 里程碑 13（WhatsApp 桥接）未开始。
+14. ✅ 里程碑 14（模板同步）
+15. ✅ 里程碑 15（端到端回归基础用例）
+
+## 已完成工作总结（2026-03-05）
+1. Provider 层兼容性修复
+修复了 `tool_calls` schema 与 DashScope/OpenAI 兼容性问题，新增 `ToolCallAdapter` 适配层，统一输出 `function` 结构，避免 `invalid_parameter_error`。
+
+2. AgentLoop 工具调用协议修正
+严格补齐 `assistant(tool_calls)` 与 `tool(tool_call_id)` 顺序，保证符合 OpenAI/DashScope 规则，新增回归测试防回退。
+
+3. 记忆系统完整落地
+支持 `save_memory` 工具调用、`window/archive_all` 模式、`last_consolidated` 更新，并接入 AgentLoop 自动归档。
+
+4. TUI 交互升级（Bubble Tea）
+新增 TUI 模式，自动回退到行式模式；支持滚动/自动跟随、状态栏、loading 动画、输入聚焦样式。
+依赖拉取需在可用 GOPROXY 下完成。
+
+5. CLI 诊断与日志
+启动时输出配置摘要（provider/model/base_url/api_key），接口错误包含请求 URL 与错误体，方便排查鉴权和参数问题。
+
+## 可复现验收命令
+1. 全量单测：
+`go test ./...`
+2. e2e 回归：
+`go test ./test/e2e -tags=e2e`
+3. CLI 基础验收：
+`go run ./cmd/lobster-go help`
+`go run ./cmd/lobster-go version`
+4. 受限环境可用：
+`GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod go test ./...`
+`GOCACHE=/tmp/go-build GOMODCACHE=/tmp/go-mod go test ./test/e2e -tags=e2e`

@@ -6,7 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 )
@@ -17,6 +20,7 @@ type OpenAIProvider struct {
 	BaseURL string
 	Model   string
 	Client  *http.Client
+	Adapter ToolCallAdapter
 }
 
 func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
@@ -27,6 +31,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespons
 	if model == "" {
 		model = p.DefaultModel()
 	}
+	model = sanitizeModel(model)
 	body := map[string]interface{}{
 		"model":       model,
 		"messages":    toOpenAIMessages(req.Messages),
@@ -49,33 +54,40 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespons
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.BaseURL, bytes.NewReader(data))
+	requestURL := normalizeChatCompletionsURL(p.BaseURL)
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(data))
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, fmt.Errorf("openai build request failed: url=%s err=%w", requestURL, err)
 	}
 	request.Header.Set("Authorization", "Bearer "+p.APIKey)
 	request.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(request)
 	if err != nil {
-		return ChatResponse{}, err
+		return ChatResponse{}, fmt.Errorf("openai request failed: url=%s err=%w", requestURL, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
-		return ChatResponse{}, fmt.Errorf("openai status %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		bodyText := strings.TrimSpace(string(body))
+		if bodyText == "" {
+			return ChatResponse{}, fmt.Errorf("openai status %d url=%s", resp.StatusCode, requestURL)
+		}
+		return ChatResponse{}, fmt.Errorf("openai status %d url=%s body=%s", resp.StatusCode, requestURL, bodyText)
 	}
 
 	var parsed struct {
 		Choices []struct {
 			Message struct {
-				Role       string          `json:"role"`
-				Content    interface{}     `json:"content"`
-				ToolCalls  []ToolCall      `json:"tool_calls,omitempty"`
-				ToolCallID string          `json:"tool_call_id,omitempty"`
-				Name       string          `json:"name,omitempty"`
+				Role       string      `json:"role"`
+				Content    interface{} `json:"content"`
+				ToolCalls  []ToolCall  `json:"tool_calls,omitempty"`
+				ToolCallID string      `json:"tool_call_id,omitempty"`
+				Name       string      `json:"name,omitempty"`
 			} `json:"message"`
 		} `json:"choices"`
+		Usage *Usage `json:"usage,omitempty"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
 		return ChatResponse{}, err
@@ -84,6 +96,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespons
 		return ChatResponse{}, errors.New("empty response")
 	}
 	msg := parsed.Choices[0].Message
+	p.adapter().Normalize(msg.ToolCalls)
 	return ChatResponse{
 		Message: ChatMessage{
 			Role:       msg.Role,
@@ -93,6 +106,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req ChatRequest) (ChatRespons
 			Name:       msg.Name,
 		},
 		HasToolCall: len(msg.ToolCalls) > 0,
+		Usage:       parsed.Usage,
 	}, nil
 }
 
@@ -105,9 +119,7 @@ func (p *OpenAIProvider) DefaultModel() string {
 
 // NewOpenAIProvider constructs provider with defaults.
 func NewOpenAIProvider(apiKey, baseURL, model string) *OpenAIProvider {
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1/chat/completions"
-	}
+	baseURL = normalizeChatCompletionsURL(baseURL)
 	if model == "" {
 		model = "gpt-4.1"
 	}
@@ -116,6 +128,7 @@ func NewOpenAIProvider(apiKey, baseURL, model string) *OpenAIProvider {
 		BaseURL: baseURL,
 		Model:   model,
 		Client:  &http.Client{Timeout: 20 * time.Second},
+		Adapter: OpenAIAdapter{},
 	}
 }
 
@@ -131,7 +144,7 @@ func toOpenAIMessages(msgs []ChatMessage) []map[string]interface{} {
 			entry["name"] = m.Name
 		}
 		if len(m.ToolCalls) > 0 {
-			entry["tool_calls"] = m.ToolCalls
+			entry["tool_calls"] = (&OpenAIAdapter{}).ToWire(m.ToolCalls)
 		}
 		if m.ToolCallID != "" {
 			entry["tool_call_id"] = m.ToolCallID
@@ -144,4 +157,37 @@ func toOpenAIMessages(msgs []ChatMessage) []map[string]interface{} {
 // sanitizeModel trims whitespace from model string.
 func sanitizeModel(model string) string {
 	return strings.TrimSpace(model)
+}
+
+func (p *OpenAIProvider) adapter() ToolCallAdapter {
+	if p.Adapter == nil {
+		return OpenAIAdapter{}
+	}
+	return p.Adapter
+}
+
+func normalizeChatCompletionsURL(baseURL string) string {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		return "https://api.openai.com/v1/chat/completions"
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return baseURL
+	}
+
+	cleanPath := strings.TrimSuffix(u.Path, "/")
+	if cleanPath == "" {
+		u.Path = "/v1/chat/completions"
+		return u.String()
+	}
+	if cleanPath == "/v1" || strings.HasSuffix(cleanPath, "/v1") {
+		u.Path = path.Join(cleanPath, "chat/completions")
+		if !strings.HasPrefix(u.Path, "/") {
+			u.Path = "/" + u.Path
+		}
+		return u.String()
+	}
+	u.Path = cleanPath
+	return u.String()
 }

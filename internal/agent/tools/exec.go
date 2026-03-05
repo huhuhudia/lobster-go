@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -47,6 +48,9 @@ func (t ExecTool) Execute(ctx context.Context, args map[string]interface{}) (str
 	if !ok || strings.TrimSpace(cmdStr) == "" {
 		return "", errors.New("cmd must be non-empty string")
 	}
+	if err := validateExecCommand(cmdStr); err != nil {
+		return "", err
+	}
 	timeout := time.Duration(t.TimeoutSec) * time.Second
 	if timeout == 0 {
 		timeout = 30 * time.Second
@@ -72,9 +76,13 @@ func (t ExecTool) Execute(ctx context.Context, args map[string]interface{}) (str
 		return "", ctx.Err()
 	}
 	if err != nil {
-		return "", errors.New(strings.TrimSpace(errBuf.String()))
+		errText := strings.TrimSpace(errBuf.String())
+		if errText == "" {
+			errText = err.Error()
+		}
+		return "", errors.New(truncateOutput(errText))
 	}
-	return strings.TrimSpace(outBuf.String()), nil
+	return truncateOutput(strings.TrimSpace(outBuf.String())), nil
 }
 
 func getEnv(k string) string {
@@ -85,3 +93,33 @@ func getEnv(k string) string {
 }
 
 var lookupEnv = os.LookupEnv
+
+const execOutputMaxChars = 10_000
+
+var blockedCommandFragments = []string{
+	"rm -rf /",
+	"rm -rf ~",
+	"mkfs",
+	"shutdown",
+	"reboot",
+	"poweroff",
+	"halt",
+	":(){:|:&};:",
+}
+
+func validateExecCommand(cmd string) error {
+	normalized := strings.ToLower(strings.TrimSpace(cmd))
+	for _, fragment := range blockedCommandFragments {
+		if strings.Contains(normalized, fragment) {
+			return fmt.Errorf("command blocked by safety policy: %s", fragment)
+		}
+	}
+	return nil
+}
+
+func truncateOutput(s string) string {
+	if len(s) <= execOutputMaxChars {
+		return s
+	}
+	return s[:execOutputMaxChars]
+}

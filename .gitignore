@@ -15,3 +15,6 @@ cmd/lobster-go/lobster-go
 *.out
 *.test
 *.bin
+*.jsonl
+
+

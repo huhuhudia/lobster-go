@@ -35,11 +35,26 @@ type ToolsConfig struct {
 	ExecTimeoutSec      int  `json:"execTimeoutSec,omitempty"`
 }
 
+// ServicesConfig covers long-running service intervals.
+type ServicesConfig struct {
+	CronIntervalSec      int `json:"cronIntervalSec,omitempty"`
+	HeartbeatIntervalSec int `json:"heartbeatIntervalSec,omitempty"`
+}
+
+// MemoryConfig controls automatic memory consolidation behavior.
+type MemoryConfig struct {
+	ConsolidateEvery int    `json:"consolidateEvery,omitempty"`
+	WindowSize       int    `json:"windowSize,omitempty"`
+	Mode             string `json:"mode,omitempty"`
+}
+
 // Config is the root configuration schema.
 type Config struct {
 	Providers map[string]ProviderConfig `json:"providers,omitempty"`
 	Agents    AgentsConfig              `json:"agents"`
 	Tools     ToolsConfig               `json:"tools"`
+	Services  ServicesConfig            `json:"services"`
+	Memory    MemoryConfig              `json:"memory"`
 }
 
 // DefaultConfig returns a config populated with sensible defaults.
@@ -57,6 +72,15 @@ func DefaultConfig() Config {
 		Tools: ToolsConfig{
 			RestrictToWorkspace: false,
 			ExecTimeoutSec:      120,
+		},
+		Services: ServicesConfig{
+			CronIntervalSec:      60,
+			HeartbeatIntervalSec: 30,
+		},
+		Memory: MemoryConfig{
+			ConsolidateEvery: 20,
+			WindowSize:       50,
+			Mode:             "window",
 		},
 	}
 }
