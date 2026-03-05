@@ -1,0 +1,17 @@
+# Ignore imported subproject
+nanobot-main/
+/cmd/lobster-go/lobster-go
+# Ignore binary artifacts
+bin/
+cmd/lobster-go/lobster-go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+*.out
+*.test
+*.bin
