@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,24 +25,55 @@ type tuiMessage struct {
 }
 
 var (
-	colorAccent  = lipgloss.Color("#7C3AED")
-	colorText    = lipgloss.Color("#1F1F1F")
-	colorMuted   = lipgloss.Color("#8C8C8C")
-	colorBg      = lipgloss.Color("#F7F7F5")
-	colorInputBg = lipgloss.Color("#FDFDFD")
-	colorStatus  = lipgloss.Color("#F1F1EF")
+	colorBg        = lipgloss.Color("#F5F5F7")
+	colorPanel     = lipgloss.Color("#ECECEC")
+	colorInputBg   = lipgloss.Color("#FFFFFF")
+	colorMuted     = lipgloss.Color("#6B6B6B")
+	colorComment   = lipgloss.Color("#8C8C8C")
+	colorText      = lipgloss.Color("#1F1F1F")
+	colorThinking  = lipgloss.Color("#D97706")
+	colorCommand   = lipgloss.Color("#2563EB")
+	colorPath      = lipgloss.Color("#059669")
+	colorSuccess   = lipgloss.Color("#16A34A")
+	colorError     = lipgloss.Color("#DC2626")
+	colorWarning   = lipgloss.Color("#D97706")
+	colorStatus    = lipgloss.Color("#7C3AED")
+	colorDivider   = lipgloss.Color("#D1D5DB")
+	colorAssistant = lipgloss.Color("#1F1F1F")
+	colorCodeText  = lipgloss.Color("#2F2F2F")
+	colorCodeBg    = lipgloss.Color("#F0F0F0")
 
-	styleUser         = lipgloss.NewStyle().Foreground(lipgloss.Color("#4C9F38")).Bold(true)
-	styleAI           = lipgloss.NewStyle().Foreground(lipgloss.Color("#1F78B4")).Bold(true)
-	styleSys          = lipgloss.NewStyle().Foreground(colorMuted)
-	styleError        = lipgloss.NewStyle().Foreground(lipgloss.Color("#D32F2F")).Bold(true)
-	styleThinking     = lipgloss.NewStyle().Foreground(lipgloss.Color("#B08968")).Italic(true)
+	styleUserTag = lipgloss.NewStyle().Foreground(colorCommand).Bold(true)
+	styleAITag   = lipgloss.NewStyle().Foreground(colorAssistant).Bold(true)
+	styleSysTag  = lipgloss.NewStyle().Foreground(colorComment)
+	styleToolTag = lipgloss.NewStyle().Foreground(colorCommand).Bold(true)
+
+	styleBody     = lipgloss.NewStyle().Background(colorBg)
+	styleSys      = lipgloss.NewStyle().Foreground(colorMuted).Background(colorBg)
+	styleError    = lipgloss.NewStyle().Foreground(colorError).Background(colorBg).Bold(true)
+	styleWarning  = lipgloss.NewStyle().Foreground(colorWarning).Background(colorBg).Bold(true)
+	styleSuccess  = lipgloss.NewStyle().Foreground(colorSuccess).Background(colorBg).Bold(true)
+	styleThinking = lipgloss.NewStyle().Foreground(colorThinking).Background(colorBg).Italic(true)
+
+	styleText   = lipgloss.NewStyle().Foreground(colorText).Background(colorBg)
+	styleCode   = lipgloss.NewStyle().Foreground(colorCodeText).Background(colorCodeBg)
+	styleCmd    = lipgloss.NewStyle().Foreground(colorCommand).Background(colorBg)
+	stylePath   = lipgloss.NewStyle().Foreground(colorPath).Background(colorBg)
+	styleInline = lipgloss.NewStyle().Foreground(colorComment).Background(colorBg)
+
+	styleHeaderBar   = lipgloss.NewStyle().Background(colorPanel)
+	styleHeaderTitle = lipgloss.NewStyle().Foreground(colorText).Background(colorPanel).Bold(true)
+	styleHeaderMuted = lipgloss.NewStyle().Foreground(colorMuted).Background(colorPanel)
+	styleHelp        = lipgloss.NewStyle().Foreground(colorMuted).Background(colorPanel)
+
 	styleInput        = lipgloss.NewStyle().Foreground(colorText).Background(colorInputBg)
-	styleInputFocused = lipgloss.NewStyle().Foreground(colorText).Background(lipgloss.Color("#FFFFFF"))
-	styleBody         = lipgloss.NewStyle().Foreground(colorText).Background(colorBg)
-	styleStatus       = lipgloss.NewStyle().Foreground(colorMuted).Background(colorStatus)
-	styleBorder       = lipgloss.NewStyle().Foreground(colorAccent)
-	styleBorderFocus  = lipgloss.NewStyle().Foreground(lipgloss.Color("#5B21B6")).Bold(true)
+	styleInputFocused = lipgloss.NewStyle().Foreground(colorText).Background(lipgloss.Color("#F9F9F9"))
+	styleStatus       = lipgloss.NewStyle().Foreground(colorStatus).Background(colorPanel)
+	styleBorderBody   = lipgloss.NewStyle().Foreground(colorDivider).Background(colorBg)
+	styleBorderPanel  = lipgloss.NewStyle().Foreground(colorDivider).Background(colorPanel)
+	styleBorderInput  = lipgloss.NewStyle().Foreground(colorDivider).Background(colorInputBg)
+	styleBorderFocus  = lipgloss.NewStyle().Foreground(colorCommand).Background(colorInputBg).Bold(true)
+	stylePrompt       = lipgloss.NewStyle().Foreground(colorCommand).Background(colorInputBg).Bold(true)
 )
 
 type outboundMsg struct {
@@ -70,9 +103,12 @@ type tuiModel struct {
 	lastPromptTokens     int
 	lastCompletionTokens int
 	lastTotalTokens      int
+	lastCachedTokens     int
 	provider             string
 	model                string
 	baseHost             string
+	workspace            string
+	restrictToWorkspace  bool
 }
 
 func runAgentTUI(ctx context.Context, cancel context.CancelFunc, b *bus.MessageBus, cfg config.Config, stdout, stderr io.Writer) int {
@@ -87,14 +123,14 @@ func runAgentTUI(ctx context.Context, cancel context.CancelFunc, b *bus.MessageB
 
 func newTUIModel(ctx context.Context, cancel context.CancelFunc, b *bus.MessageBus, cfg config.Config) tuiModel {
 	ti := textinput.New()
-	ti.Placeholder = "Type a message..."
+	ti.Placeholder = "Message..."
 	ti.Prompt = ""
 	ti.TextStyle = lipgloss.NewStyle().Foreground(colorText)
 	ti.Focus()
 	ti.CharLimit = 4096
 
 	sp := spinner.New()
-	sp.Spinner = spinner.Dot
+	sp.Spinner = spinner.MiniDot
 
 	m := tuiModel{
 		ctx:        ctx,
@@ -105,15 +141,19 @@ func newTUIModel(ctx context.Context, cancel context.CancelFunc, b *bus.MessageB
 		help:       false,
 		autoFollow: true,
 	}
+	if wd, err := os.Getwd(); err == nil && wd != "" {
+		m.workspace = filepath.Base(wd)
+	} else {
+		m.workspace = "workspace"
+	}
+	m.restrictToWorkspace = cfg.Tools.RestrictToWorkspace
 
 	provider, model, baseURL, apiKey := configSummary(cfg)
 	m.provider = provider
 	m.model = model
 	m.baseHost = baseURLHost(baseURL)
-	m.appendSystem("commands: /help /clear /exit")
-	m.appendSystem(fmt.Sprintf("config: provider=%s model=%s", provider, model))
-	m.appendSystem(fmt.Sprintf("config: base_url=%s", baseURL))
-	m.appendSystem(fmt.Sprintf("config: api_key=%s", apiKey))
+	_ = apiKey
+	m.appendSystem("Ready. Type /help for commands.")
 	return m
 }
 
@@ -188,7 +228,7 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		m.input.Width = max(10, m.width-8)
+		m.input.Width = max(10, m.width-10)
 	case outboundMsg:
 		if msg.err != nil {
 			if errors.Is(msg.err, context.Canceled) {
@@ -202,6 +242,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.channel == "cli" {
 			m.appendAssistant(msg.content)
+			if usageLine := formatUsageLine(msg.metadata); usageLine != "" {
+				m.appendSystem(usageLine)
+			}
 			if !m.lastSentAt.IsZero() {
 				m.lastLatency = time.Since(m.lastSentAt)
 			}
@@ -221,6 +264,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if ct, ok := msg.metadata["completion_tokens"]; ok {
 					m.lastCompletionTokens = parseInt(ct)
+				}
+				if cached, ok := msg.metadata["cached_tokens"]; ok {
+					m.lastCachedTokens = parseInt(cached)
 				}
 				if ms, ok := msg.metadata["latency_ms"]; ok {
 					if parsed := parseMillis(ms); parsed > 0 {
@@ -243,14 +289,21 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m tuiModel) View() string {
 	var b strings.Builder
+	header := renderFullLine(styleHeaderBar, m.headerLine(), m.width)
+	b.WriteString(header)
+	b.WriteString("\n")
+	headerLines := 1
+	if m.help {
+		b.WriteString(renderFullLine(styleHelp, m.helpLine(), m.width))
+		b.WriteString("\n")
+		headerLines++
+	}
+
 	bodyLines := renderMessages(m.messages, max(10, m.width-2))
 	if m.thinking {
-		bodyLines = append(bodyLines, styleThinking.Render("Thinking: "+m.spin.View()))
+		bodyLines = append(bodyLines, styleThinking.Render("Thinking "+m.spin.View()))
 	}
-	available := m.height - 3
-	if available < 3 {
-		available = 3
-	}
+	available := m.bodyHeight(headerLines)
 	if len(bodyLines) > available {
 		offset := clamp(m.scrollOffset, 0, max(0, len(bodyLines)-available))
 		start := max(0, len(bodyLines)-available-offset)
@@ -260,17 +313,18 @@ func (m tuiModel) View() string {
 		b.WriteString(renderWithBorder(styleBody, line, m.width))
 		b.WriteString("\n")
 	}
-	b.WriteString(renderWithBorder(styleStatus, m.statusLine(), m.width))
+	b.WriteString(renderWithBorderWithStyle(styleBorderPanel, styleStatus, m.statusLine(), m.width))
 	b.WriteString("\n")
 	inputStyle := styleInput
 	if m.input.Focused() {
 		inputStyle = styleInputFocused
 	}
-	borderStyle := styleBorder
+	borderStyle := styleBorderInput
 	if m.input.Focused() {
 		borderStyle = styleBorderFocus
 	}
-	b.WriteString(renderWithBorderWithStyle(borderStyle, inputStyle, m.input.View(), m.width))
+	prompt := stylePrompt.Render("❯ ")
+	b.WriteString(renderWithBorderWithStyle(borderStyle, inputStyle, prompt+m.input.View(), m.width))
 	return b.String()
 }
 
@@ -298,10 +352,11 @@ func (m *tuiModel) appendAssistant(text string) {
 
 func (m tuiModel) maxScrollOffset() int {
 	bodyLines := renderMessages(m.messages, max(10, m.width-2))
-	available := m.height - 4
-	if available < 3 {
-		available = 3
+	headerLines := 1
+	if m.help {
+		headerLines++
 	}
+	available := m.bodyHeight(headerLines)
 	if len(bodyLines) <= available {
 		return 0
 	}
@@ -311,28 +366,84 @@ func (m tuiModel) maxScrollOffset() int {
 func renderMessages(msgs []tuiMessage, width int) []string {
 	var out []string
 	for _, msg := range msgs {
-		prefix := msg.role + " > "
-		prefixStyle := styleSys
+		tag := "SYS"
+		tagStyle := styleSysTag
+		contentStyle := styleSys
 		switch msg.role {
 		case "you":
-			prefixStyle = styleUser
+			tag = "YOU"
+			tagStyle = styleUserTag
+			contentStyle = styleText
 		case "ai":
-			prefixStyle = styleAI
+			tag = "AI"
+			tagStyle = styleAITag
+			contentStyle = styleText
 		case "sys":
-			if strings.HasPrefix(msg.content, "error:") {
-				prefixStyle = styleError
-			} else if strings.HasPrefix(strings.ToLower(msg.content), "thinking:") {
-				prefixStyle = styleThinking
+			lower := strings.ToLower(strings.TrimSpace(msg.content))
+			if strings.HasPrefix(msg.content, "error:") || strings.HasPrefix(lower, "error") {
+				tag = "ERR"
+				tagStyle = styleError
+				contentStyle = styleError
+			} else if strings.HasPrefix(lower, "tool") {
+				tag = "TOOL"
+				tagStyle = styleToolTag
+				contentStyle = styleToolTag
+			} else if strings.HasPrefix(lower, "thinking:") {
+				tag = "THINK"
+				tagStyle = styleThinking
+				contentStyle = styleThinking
 			} else {
-				prefixStyle = styleSys
+				tag = "SYS"
+				tagStyle = styleSysTag
+				contentStyle = styleSys
 			}
 		}
-		lines := wrapText(msg.content, max(10, width-len(prefix)))
-		for i, line := range lines {
-			if i == 0 {
-				out = append(out, prefixStyle.Render(prefix)+line)
+		prefix := tagStyle.Render(tag) + " "
+		prefixWidth := lipgloss.Width(prefix)
+		spacer := strings.Repeat(" ", prefixWidth)
+		firstLine := true
+		inCode := false
+		for _, rawLine := range splitLines(msg.content) {
+			trim := strings.TrimSpace(rawLine)
+			if strings.HasPrefix(trim, "```") {
+				inCode = !inCode
+				continue
+			}
+			lineStyle := contentStyle
+			if inCode {
+				lineStyle = styleCode
 			} else {
-				out = append(out, strings.Repeat(" ", len(prefix))+line)
+				switch {
+				case strings.HasPrefix(trim, "✔") || strings.HasPrefix(strings.ToLower(trim), "ok"):
+					lineStyle = styleSuccess
+				case strings.HasPrefix(trim, "⚠") || strings.HasPrefix(strings.ToLower(trim), "warn"):
+					lineStyle = styleWarning
+				case strings.HasPrefix(trim, "✖") || strings.HasPrefix(strings.ToLower(trim), "error"):
+					lineStyle = styleError
+				case strings.HasPrefix(trim, "$ ") || strings.HasPrefix(trim, "> ") || strings.HasPrefix(trim, "cmd:") || strings.HasPrefix(trim, "command:"):
+					lineStyle = styleCmd
+				case isPathLine(trim):
+					lineStyle = stylePath
+				}
+			}
+
+			var lines []string
+			if inCode {
+				lines = wrapTextRaw(rawLine, max(10, width-prefixWidth))
+			} else {
+				lines = wrapText(rawLine, max(10, width-prefixWidth))
+			}
+			for i, line := range lines {
+				rendered := lineStyle.Render(line)
+				renderPrefix := spacer
+				if firstLine {
+					renderPrefix = prefix
+				}
+				if i == 0 && !firstLine {
+					renderPrefix = spacer
+				}
+				out = append(out, renderPrefix+rendered)
+				firstLine = false
 			}
 		}
 	}
@@ -359,6 +470,51 @@ func wrapText(text string, width int) []string {
 	}
 	lines = append(lines, line)
 	return lines
+}
+
+func wrapTextRaw(text string, width int) []string {
+	if width <= 0 {
+		return []string{text}
+	}
+	if text == "" {
+		return []string{""}
+	}
+	var out []string
+	var buf []rune
+	for _, r := range text {
+		buf = append(buf, r)
+		if len(buf) >= width {
+			out = append(out, string(buf))
+			buf = buf[:0]
+		}
+	}
+	if len(buf) > 0 {
+		out = append(out, string(buf))
+	}
+	return out
+}
+
+func splitLines(text string) []string {
+	if text == "" {
+		return []string{""}
+	}
+	return strings.Split(text, "\n")
+}
+
+func isPathLine(line string) bool {
+	if line == "" {
+		return false
+	}
+	if strings.HasPrefix(line, "./") || strings.HasPrefix(line, "../") || strings.HasPrefix(line, "/") {
+		return true
+	}
+	if strings.HasSuffix(line, "/") && !strings.Contains(line, " ") {
+		return true
+	}
+	if strings.Contains(line, "/") && !strings.Contains(line, " ") && len(line) <= 80 {
+		return true
+	}
+	return false
 }
 
 func configSummary(cfg config.Config) (string, string, string, string) {
@@ -445,7 +601,7 @@ func renderWithBorderWithStyle(borderStyle, contentStyle lipgloss.Style, line st
 }
 
 func renderWithBorder(style lipgloss.Style, line string, width int) string {
-	return renderWithBorderWithStyle(styleBorder, style, line, width)
+	return renderWithBorderWithStyle(styleBorderBody, style, line, width)
 }
 
 func parseInt(v string) int {
@@ -486,17 +642,34 @@ func extractStatusCode(errMsg string) string {
 	return code
 }
 
-func latencyBucket(d time.Duration) string {
-	switch {
-	case d < time.Second:
-		return "<1s"
-	case d < 3*time.Second:
-		return "1-3s"
-	case d < 10*time.Second:
-		return "3-10s"
-	default:
-		return ">10s"
+func formatUsageLine(meta map[string]string) string {
+	if len(meta) == 0 {
+		return ""
 	}
+	total := parseInt(meta["total_tokens"])
+	if total == 0 {
+		total = parseInt(meta["prompt_tokens"]) + parseInt(meta["completion_tokens"])
+	}
+	cached := parseInt(meta["cached_tokens"])
+	notHit := "-"
+	if total > 0 {
+		net := total - cached
+		if net < 0 {
+			net = 0
+		}
+		notHit = fmt.Sprintf("%d", net)
+	}
+	hit := fmt.Sprintf("%d", cached)
+	usetime := strings.TrimSpace(meta["latency_ms"])
+	if usetime == "" {
+		usetime = "-"
+	} else if !strings.HasSuffix(usetime, "ms") {
+		usetime = usetime + "ms"
+	}
+	if total == 0 && usetime == "-" && cached == 0 {
+		return ""
+	}
+	return fmt.Sprintf("hit_cache %s | not_hit %s | usetime %s", hit, notHit, usetime)
 }
 
 func baseURLHost(baseURL string) string {
@@ -512,18 +685,6 @@ func baseURLHost(baseURL string) string {
 }
 
 func (m tuiModel) statusLine() string {
-	thinking := ""
-	if m.thinking {
-		thinking = " " + styleThinking.Render("Thinking:") + " " + styleThinking.Render(m.spin.View())
-	}
-	latency := "-"
-	if m.lastLatency > 0 {
-		latency = latencyBucket(m.lastLatency)
-	}
-	tokens := "-"
-	if m.lastTotalTokens > 0 {
-		tokens = fmt.Sprintf("%d", m.lastTotalTokens)
-	}
 	errCode := ""
 	if m.lastErrorCode != "" {
 		errCode = " err:" + m.lastErrorCode
@@ -532,8 +693,41 @@ func (m tuiModel) statusLine() string {
 	if maxScroll := m.maxScrollOffset(); maxScroll > 0 {
 		scroll = fmt.Sprintf(" scroll:%d/%d", m.maxScrollOffset()-m.scrollOffset, m.maxScrollOffset())
 	}
-	left := fmt.Sprintf("Build %s • %s • tok:%s", m.model, latency, tokens)
-	right := fmt.Sprintf("ctrl+t variants  tab agents  ctrl+p commands")
-	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right)-4)
-	return left + strings.Repeat(" ", space) + right + errCode + thinking + scroll
+	right := fmt.Sprintf("[Enter] Send  [Ctrl+C] Cancel  [/command]")
+	space := max(1, m.width-lipgloss.Width(right)-2)
+	return strings.Repeat(" ", space) + right + errCode + scroll
+}
+
+func (m tuiModel) headerLine() string {
+	sandbox := "full"
+	if m.restrictToWorkspace {
+		sandbox = "workspace-write"
+	}
+	left := styleHeaderTitle.Render("lobster-go") + styleHeaderMuted.Render(" | Model: "+m.model+" | Sandbox: "+sandbox+" | Session: active")
+	right := styleHeaderMuted.Render("Project: " + m.workspace)
+	space := max(1, m.width-lipgloss.Width(left)-lipgloss.Width(right))
+	return left + strings.Repeat(" ", space) + right
+}
+
+func (m tuiModel) helpLine() string {
+	return "Shortcuts: /help  /clear  /exit  •  PgUp/PgDn  Home/End  •  Ctrl+C"
+}
+
+func (m tuiModel) bodyHeight(headerLines int) int {
+	available := m.height - headerLines - 2
+	if available < 3 {
+		return 3
+	}
+	return available
+}
+
+func renderFullLine(style lipgloss.Style, line string, width int) string {
+	if width <= 0 {
+		return style.Render(line)
+	}
+	padding := width - lipgloss.Width(line)
+	if padding < 0 {
+		padding = 0
+	}
+	return style.Render(line + strings.Repeat(" ", padding))
 }

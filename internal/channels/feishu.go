@@ -700,7 +700,7 @@ func formatUsageSuffix(meta map[string]string) string {
 	if usetime == "" {
 		usetime = "-"
 	}
-	return "hit_cache_token:" + cached + " token:" + netTokens + " usetime:" + usetime
+	return "hit_cache " + cached + " | not_hit " + netTokens + " | usetime " + usetime
 }
 
 func (f *FeishuChannel) reactionEmoji() string {

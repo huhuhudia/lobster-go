@@ -123,8 +123,8 @@ test/                           # 集成与端到端用例
 16. ⬜ 渠道矩阵扩展
 验收标准：落地 Telegram/Slack/Discord/Email 至少一项；各自入站/出站与权限测试。
 
-17. ⬜ Skills 加载与执行
-验收标准：读取 `skills/*/SKILL.md` 并支持最小工作流（指令发现/执行/模板注入）；新增测试。
+17. ⚠️ Skills 加载与执行
+验收标准：读取 `skills/*/SKILL.md` 并支持最小工作流（指令发现/执行/模板注入）；新增测试。当前仅完成加载/摘要/Always Skills 注入，执行与模板注入待补齐。
 
 ## 当前里程碑状态（2026-03-06）
 1. ✅ 里程碑 1（代码骨架与构建链路）
@@ -138,10 +138,12 @@ test/                           # 集成与端到端用例
 9. ⚠️ 里程碑 9（Cron 服务）当前为固定间隔任务模型，尚未实现完整 cron 表达式与去重语义。
 10. ⚠️ 里程碑 10（Heartbeat）已支持定时发布，指标维度与 HEARTBEAT.md 任务语义未对齐。
 11. ✅ 里程碑 11（CLI 交互基础命令）
-12. ⚠️ 里程碑 12（Channels）Feishu + Mock 已落地，其它渠道待补充；Feishu 表格解析 TODO。
+12. ⚠️ 里程碑 12（Channels）Feishu（WebSocket）+ Mock 已落地，入站日志/自动表情/失败回退已覆盖，其它渠道待补充。
 13. ⬜ 里程碑 13（WhatsApp 桥接）未开始。
 14. ✅ 里程碑 14（模板同步）
 15. ✅ 里程碑 15（端到端回归基础用例）
+16. ⬜ 里程碑 16（渠道矩阵扩展）未开始。
+17. ⚠️ 里程碑 17（Skills 加载与执行）已完成技能加载与摘要注入，执行/模板注入未完成。
 
 ## 已完成工作总结（2026-03-06）
 1. Provider 层兼容性修复
@@ -159,6 +161,21 @@ test/                           # 集成与端到端用例
 
 5. CLI 诊断与日志
 启动时输出配置摘要（provider/model/base_url/api_key），接口错误包含请求 URL 与错误体，方便排查鉴权和参数问题。
+
+6. Gateway 与 Feishu WebSocket 落地
+新增 `gateway` 服务，统一运行 AgentLoop + Channels + Heartbeat，支持 Feishu WebSocket 长连接；入站消息日志与 outbound 派发完整打通。
+
+7. Feishu 通道增强
+修复 `receive_id_type` 参数位置、卡片结构与降级文本逻辑；新增自动表情回复，内置表情类型规范化；日志输出支持敏感信息脱敏。
+
+8. Skills 加载模块
+新增 `internal/skills`，支持技能摘要与 Always Skills 注入到系统提示词，并附测试覆盖。
+
+9. Prompt caching 与用量统计
+请求侧支持 `prompt_cache_key`/`prompt_cache_retention`，响应侧解析 `cached_tokens`，输出 `hit_cache_token/token/usetime`。
+
+10. LLM 流式与超时策略
+默认优先流式；SSE 解析支持 `tool_calls` 与 usage；新增 `llmTimeoutSec` 独立超时配置，移除 `http.Client` 硬超时以避免 20s 误杀。
 
 ## 可复现验收命令
 1. 全量单测：
