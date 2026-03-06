@@ -29,6 +29,9 @@ func TestLoadMissingReturnsDefault(t *testing.T) {
 	if cfg.Tools.ExecTimeoutSec != 120 {
 		t.Fatalf("default ExecTimeoutSec mismatch, got %d", cfg.Tools.ExecTimeoutSec)
 	}
+	if cfg.Agents.Defaults.LLMTimeoutSec != 120 {
+		t.Fatalf("default LLMTimeoutSec mismatch, got %d", cfg.Agents.Defaults.LLMTimeoutSec)
+	}
 	if cfg.Services.CronIntervalSec != 60 {
 		t.Fatalf("default CronIntervalSec mismatch, got %d", cfg.Services.CronIntervalSec)
 	}
@@ -59,7 +62,8 @@ func TestLoadSnakeCase(t *testing.T) {
 				"model": "gpt-test",
 				"provider": "openai",
 				"temperature": 0.3,
-				"max_tokens": 1234
+				"max_tokens": 1234,
+				"llm_timeout_sec": 77
 			}
 		},
 		"tools": {
@@ -88,6 +92,9 @@ func TestLoadSnakeCase(t *testing.T) {
 	}
 	if cfg.Agents.Defaults.MaxTokens != 1234 {
 		t.Fatalf("max tokens mismatch: %d", cfg.Agents.Defaults.MaxTokens)
+	}
+	if cfg.Agents.Defaults.LLMTimeoutSec != 77 {
+		t.Fatalf("llm timeout mismatch: %d", cfg.Agents.Defaults.LLMTimeoutSec)
 	}
 	if !cfg.Tools.RestrictToWorkspace {
 		t.Fatalf("restrict flag not parsed")

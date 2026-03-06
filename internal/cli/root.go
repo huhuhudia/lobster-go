@@ -19,11 +19,13 @@ import (
 	"github.com/huhuhudia/lobster-go/internal/bus"
 	"github.com/huhuhudia/lobster-go/internal/config"
 	"github.com/huhuhudia/lobster-go/internal/cron"
+	"github.com/huhuhudia/lobster-go/internal/gateway"
 	"github.com/huhuhudia/lobster-go/internal/heartbeat"
 	"github.com/huhuhudia/lobster-go/internal/providers"
 	"github.com/huhuhudia/lobster-go/internal/session"
 	"github.com/huhuhudia/lobster-go/internal/templates"
 	"github.com/huhuhudia/lobster-go/internal/version"
+	"strconv"
 )
 
 // Execute is the entrypoint used by main. It returns an exit code for os.Exit.
@@ -55,6 +57,8 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) int {
 		return runCron(args[1:], stdout, stderr)
 	case "heartbeat":
 		return runHeartbeat(stdout, stderr)
+	case "gateway":
+		return runGateway(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		printHelp(stderr)
@@ -70,6 +74,7 @@ func printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  lobster-go session list   List sessions")
 	fmt.Fprintln(w, "  lobster-go cron       Run cron service")
 	fmt.Fprintln(w, "  lobster-go heartbeat  Run heartbeat service")
+	fmt.Fprintln(w, "  lobster-go gateway    Run gateway service (--port/-p, --workspace/-w)")
 	fmt.Fprintln(w, "  lobster-go version    Show version")
 	fmt.Fprintln(w, "  lobster-go help       Show this help")
 }
@@ -88,6 +93,10 @@ func agentLoopConfigFromConfig(cfg config.Config, workspace string) agent.LoopCo
 	if timeoutSec <= 0 {
 		timeoutSec = config.DefaultConfig().Tools.ExecTimeoutSec
 	}
+	llmTimeoutSec := cfg.Agents.Defaults.LLMTimeoutSec
+	if llmTimeoutSec <= 0 {
+		llmTimeoutSec = timeoutSec
+	}
 	return agent.LoopConfig{
 		Model:                  cfg.Agents.Defaults.Model,
 		Temperature:            cfg.Agents.Defaults.Temperature,
@@ -95,9 +104,13 @@ func agentLoopConfigFromConfig(cfg config.Config, workspace string) agent.LoopCo
 		Workspace:              workspace,
 		RestrictToWorkspace:    cfg.Tools.RestrictToWorkspace,
 		ExecTimeoutSec:         timeoutSec,
+		LLMTimeoutSec:          llmTimeoutSec,
 		MemoryConsolidateEvery: cfg.Memory.ConsolidateEvery,
 		MemoryWindowSize:       cfg.Memory.WindowSize,
 		MemoryMode:             cfg.Memory.Mode,
+		PromptCacheKey:         cfg.Agents.Defaults.PromptCacheKey,
+		PromptCacheRetention:   cfg.Agents.Defaults.PromptCacheRetention,
+		MaxHistoryMessages:     cfg.Agents.Defaults.MaxHistoryMessages,
 	}
 }
 
@@ -114,7 +127,7 @@ func runAgent(stdout, stderr io.Writer) int {
 	workspace := "."
 	b := bus.New(100)
 	sessions := session.NewManager(workspace)
-	builder := agentctx.Builder{SystemPrompt: "You are lobster-go agent."}
+	builder := agentctx.Builder{SystemPrompt: "You are lobster-go agent.", Workspace: workspace}
 	prov := providers.BuildProvider(cfg)
 	loopCfg := agentLoopConfigFromConfig(cfg, workspace)
 	loop := agent.NewLoop(b, prov, sessions, builder, loopCfg)
@@ -591,4 +604,113 @@ func runHeartbeat(stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout, "Heartbeat service stopped.")
 	return 0
+}
+
+// ============================================================================
+// Gateway Command
+// ============================================================================
+
+func runGateway(args []string, stdout, stderr io.Writer) int {
+	cfg := loadConfigOrDefault(stderr)
+	workspace := defaultWorkspace()
+	port := 18790
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--workspace", "-w":
+			if i+1 >= len(args) {
+				fmt.Fprintln(stderr, "missing value for --workspace")
+				return 1
+			}
+			workspace = args[i+1]
+			i++
+		case "--port", "-p":
+			if i+1 >= len(args) {
+				fmt.Fprintln(stderr, "missing value for --port")
+				return 1
+			}
+			if p, err := strconv.Atoi(args[i+1]); err == nil && p > 0 {
+				port = p
+			} else {
+				fmt.Fprintln(stderr, "invalid port")
+				return 1
+			}
+			i++
+		}
+	}
+
+	svc, err := gateway.Build(cfg, workspace)
+	if err != nil {
+		fmt.Fprintf(stderr, "gateway build error: %v\n", err)
+		return 1
+	}
+
+	logGatewayConfig(stdout, cfg)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if cfg.Channels.Feishu.Enabled && cfg.Channels.Feishu.UseWebhook {
+		_ = svc.StartHTTP(ctx, fmt.Sprintf(":%d", port))
+		fmt.Fprintf(stdout, "HTTP webhook: http://localhost:%d/feishu/webhook\n", port)
+	}
+
+	go func() {
+		if err := svc.Run(ctx); err != nil {
+			fmt.Fprintf(stderr, "gateway stopped: %v\n", err)
+			cancel()
+		}
+	}()
+
+	fmt.Fprintf(stdout, "Gateway running. Workspace: %s\n", workspace)
+	fmt.Fprintln(stdout, "Press Ctrl+C to stop.")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-sigCh:
+		cancel()
+	case <-ctx.Done():
+	}
+	return 0
+}
+
+func defaultWorkspace() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "."
+	}
+	return filepath.Join(home, ".lobster", "workspace")
+}
+
+func logGatewayConfig(stdout io.Writer, cfg config.Config) {
+	if cfg.Channels.Feishu.Enabled {
+		appID := cfg.Channels.Feishu.AppID
+		appSecret := formatSecretForLog(cfg.Channels.Feishu.AppSecret)
+		mode := "websocket"
+		if cfg.Channels.Feishu.UseWebhook {
+			mode = "webhook"
+		}
+		fmt.Fprintf(stdout, "channel: feishu enabled mode=%s app_id=%s app_secret=%s\n", mode, appID, appSecret)
+	}
+	if cfg.Channels.Mock.Enabled {
+		name := cfg.Channels.Mock.Name
+		if strings.TrimSpace(name) == "" {
+			name = "mock"
+		}
+		fmt.Fprintf(stdout, "channel: mock enabled name=%s\n", name)
+	}
+}
+
+func formatSecretForLog(secret string) string {
+	if os.Getenv("LOBSTER_LOG_FULL_APP_SECRET") == "1" {
+		return secret
+	}
+	secret = strings.TrimSpace(secret)
+	if secret == "" {
+		return "(empty)"
+	}
+	if len(secret) <= 8 {
+		return "****"
+	}
+	return secret[:4] + "..." + secret[len(secret)-4:]
 }

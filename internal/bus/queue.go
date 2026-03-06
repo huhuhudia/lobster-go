@@ -3,6 +3,7 @@ package bus
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 )
 
 // MessageBus is an in-memory queue for inbound/outbound traffic.
@@ -11,6 +12,7 @@ type MessageBus struct {
 	outbound chan OutboundMessage
 	once     sync.Once
 	closed   chan struct{}
+	inboundLogger atomic.Value // func(InboundMessage)
 }
 
 // New creates a MessageBus with buffered channels.
@@ -34,6 +36,7 @@ func (b *MessageBus) PublishInbound(msg InboundMessage) error {
 	}
 	select {
 	case b.inbound <- msg:
+		b.logInbound(msg)
 		return nil
 	case <-b.closed:
 		return ErrClosed
@@ -91,6 +94,23 @@ func (b *MessageBus) InboundSize() int { return len(b.inbound) }
 
 // OutboundSize returns approximate buffered outbound count.
 func (b *MessageBus) OutboundSize() int { return len(b.outbound) }
+
+// SetInboundLogger sets a callback invoked after a message is published to inbound.
+func (b *MessageBus) SetInboundLogger(fn func(InboundMessage)) {
+	if fn == nil {
+		b.inboundLogger.Store(nil)
+		return
+	}
+	b.inboundLogger.Store(fn)
+}
+
+func (b *MessageBus) logInbound(msg InboundMessage) {
+	if v := b.inboundLogger.Load(); v != nil {
+		if fn, ok := v.(func(InboundMessage)); ok {
+			fn(msg)
+		}
+	}
+}
 
 // ErrClosed indicates the bus has been closed.
 var ErrClosed = context.Canceled

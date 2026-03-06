@@ -273,7 +273,7 @@ func TestFeishuChannel_BuildCard(t *testing.T) {
 		t.Fatal("elements should not be empty")
 	}
 
-	if elements[0]["tag"] != "markdown" {
-		t.Errorf("expected markdown tag, got %v", elements[0]["tag"])
+	if elements[0]["tag"] != "div" {
+		t.Errorf("expected div tag, got %v", elements[0]["tag"])
 	}
 }

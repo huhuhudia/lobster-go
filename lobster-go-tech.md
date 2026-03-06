@@ -4,6 +4,7 @@
 1. 使用 Go 1.22 重写 nanobot，保持目录与功能对齐，仓库名 `lobster-go`，优先完成框架骨架后逐步填充细节。
 2. 兼容多渠道聊天、工具调用、子代理、记忆、计划任务、心跳、CLI、WhatsApp 桥接等核心能力；接口语义与用户体验与 nanobot 一致。
 3. 保持可测试性，每个里程碑必须有可运行的单元或集成测试并在提交前自测通过。
+4. 对齐 nanobot 的关键交互：模板（AGENTS/TOOLS/USER/SOUL/HEARTBEAT）、技能体系、完整 cron 语义、更多渠道适配。
 
 ## 建议目录结构（初版）
 ```
@@ -34,7 +35,7 @@ test/                           # 集成与端到端用例
 4. Session 与持久化：实现 JSONL 会话存储、历史切片、迁移逻辑；Tests: 保存/加载、截断策略、线程安全。
 5. Provider 抽象：定义 Chat API 接口，提供 OpenAI 实现与 Mock Provider，支持工具调用结构；Tests: mock 交互、超时与错误传播。
 6. AgentLoop 核心：完成迭代循环、上下文构建、工具注册、工具结果截断、最大迭代保护、子代理管理；Tests: 使用 Mock Provider + Fake Tools 驱动多轮对话，验证工具调用与回复路由。
-7. 工具层：实现文件读写编辑、目录列举、Shell Exec（可选工作区限制）、Web Search/Fetch（Brave API stub）、MessageTool、SpawnTool、CronTool、MCP 客户端接口；Tests: 每个工具的功能与错误路径，Exec 沙箱限制，Web 调用超时。
+7. 工具层：实现文件读写编辑、目录列举、Shell Exec（可选工作区限制）、Web Search/Fetch（Brave API stub → 真实 API）、MessageTool、SpawnTool、CronTool、MCP 客户端接口；Tests: 每个工具的功能与错误路径，Exec 沙箱限制，Web 调用超时。
 8. 记忆系统：实现 MEMORY/HISTORY 读写与 consolidate 流程（使用 Mock Provider 的 save_memory 工具调用），支持 archive_all 与窗口模式；Tests: 长对话合并、last_consolidated 更新、文件内容校验。
 9. Cron 服务：解析 cron 表达式、去重、run-once 支持，与 Agent 通过 Bus 互动；Tests: 时间驱动的任务触发、重复保护、命令行 `lobster-go cron`。
 10. Heartbeat 服务：周期收集队列长度、活跃会话等指标，向 Bus 发布 Outbound；Tests: 指标采样与格式验证。
@@ -104,24 +105,45 @@ test/                           # 集成与端到端用例
 10. ✅ 收敛里程碑文档与实际状态
 验收标准：逐项更新本文里程碑状态，已完成项标记 `✅`，并附可复现的测试命令。
 
-## 当前里程碑状态（2026-03-05）
+11. ⬜ 上下文拼装与模板注入
+验收标准：`Builder` 引入 AGENTS/TOOLS/USER/SOUL/HEARTBEAT 与 MEMORY/HISTORY 的组装逻辑；模板缺失自动同步；新增覆盖测试。
+
+12. ⬜ Web Search 真实接入
+验收标准：`web_search` 接入真实 API（如 Brave），支持 `proxy` 与 key；测试覆盖空 query、超时、失败路径。
+
+13. ⬜ Cron 语义补齐
+验收标准：支持 cron 表达式、去重、run-once；`cron` CLI/list 输出真实任务；新增行为测试。
+
+14. ⬜ Heartbeat 指标扩展
+验收标准：输出队列长度、活跃会话、最近错误等指标；支持读取 HEARTBEAT.md 任务；测试覆盖。
+
+15. ⬜ 关键工具补齐
+验收标准：补 `edit_file`、`spawn`、`cron tool`、`mcp client`；新增单测覆盖。
+
+16. ⬜ 渠道矩阵扩展
+验收标准：落地 Telegram/Slack/Discord/Email 至少一项；各自入站/出站与权限测试。
+
+17. ⬜ Skills 加载与执行
+验收标准：读取 `skills/*/SKILL.md` 并支持最小工作流（指令发现/执行/模板注入）；新增测试。
+
+## 当前里程碑状态（2026-03-06）
 1. ✅ 里程碑 1（代码骨架与构建链路）
 2. ✅ 里程碑 2（配置系统）
 3. ✅ 里程碑 3（消息总线与事件模型）
 4. ✅ 里程碑 4（Session 与持久化）
 5. ✅ 里程碑 5（Provider 抽象）
 6. ✅ 里程碑 6（AgentLoop 核心，含多 tool call/错误兜底/迭代保护）
-7. ✅ 里程碑 7（工具层，含 exec 安全策略与文件越界测试）
+7. ✅ 里程碑 7（工具层基础完成：文件/exec/web_fetch/web_search stub/message；缺 edit_file、spawn、cron tool、MCP）
 8. ✅ 里程碑 8（记忆系统）已支持 Provider `save_memory` 工具调用、`archive_all/window` 两种模式、`last_consolidated` 更新、文件校验测试，并接入 AgentLoop 按阈值自动归档。
 9. ⚠️ 里程碑 9（Cron 服务）当前为固定间隔任务模型，尚未实现完整 cron 表达式与去重语义。
-10. ⚠️ 里程碑 10（Heartbeat）已支持定时发布，指标维度仍可扩展。
+10. ⚠️ 里程碑 10（Heartbeat）已支持定时发布，指标维度与 HEARTBEAT.md 任务语义未对齐。
 11. ✅ 里程碑 11（CLI 交互基础命令）
-12. ⚠️ 里程碑 12（Channels）Feishu + Mock 已落地，其它渠道待补充。
+12. ⚠️ 里程碑 12（Channels）Feishu + Mock 已落地，其它渠道待补充；Feishu 表格解析 TODO。
 13. ⬜ 里程碑 13（WhatsApp 桥接）未开始。
 14. ✅ 里程碑 14（模板同步）
 15. ✅ 里程碑 15（端到端回归基础用例）
 
-## 已完成工作总结（2026-03-05）
+## 已完成工作总结（2026-03-06）
 1. Provider 层兼容性修复
 修复了 `tool_calls` schema 与 DashScope/OpenAI 兼容性问题，新增 `ToolCallAdapter` 适配层，统一输出 `function` 结构，避免 `invalid_parameter_error`。
 

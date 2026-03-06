@@ -8,11 +8,18 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+
+	larkdispatcher "github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
+	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
+	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 
 	"github.com/huhuhudia/lobster-go/internal/bus"
 	"github.com/huhuhudia/lobster-go/pkg/logging"
@@ -25,6 +32,8 @@ type FeishuConfig struct {
 	AppSecret         string   `json:"appSecret"`
 	EncryptKey        string   `json:"encryptKey,omitempty"`
 	VerificationToken string   `json:"verificationToken,omitempty"`
+	UseWebhook        bool     `json:"useWebhook,omitempty"`
+	UseCard           bool     `json:"useCard,omitempty"`
 	AllowFrom         []string `json:"allowFrom,omitempty"`
 	ReactEmoji        string   `json:"reactEmoji,omitempty"`
 }
@@ -32,13 +41,14 @@ type FeishuConfig struct {
 // FeishuChannel implements the Feishu/Lark bot using WebSocket long connection.
 type FeishuChannel struct {
 	BaseChannel
-	Config           FeishuConfig
+	Config            FeishuConfig
 	tenantAccessToken string
 	tokenExpiry       time.Time
 	tokenMutex        sync.Mutex
 	httpClient        *http.Client
 	processedMsgIDs   map[string]time.Time
 	processedMutex    sync.Mutex
+	wsClient          *larkws.Client
 }
 
 // NewFeishuChannel creates a new Feishu channel.
@@ -48,8 +58,8 @@ func NewFeishuChannel(cfg FeishuConfig, b *bus.MessageBus) *FeishuChannel {
 			Name: "feishu",
 			Bus:  b,
 		},
-		Config:         cfg,
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		Config:          cfg,
+		httpClient:      &http.Client{Timeout: 30 * time.Second},
 		processedMsgIDs: make(map[string]time.Time),
 	}
 }
@@ -66,13 +76,39 @@ func (f *FeishuChannel) Start(ctx context.Context) error {
 	}
 
 	f.Running = true
-	logging.Default.Info("Feishu bot started with WebSocket long connection")
+	if f.Config.UseWebhook {
+		logging.Default.Info("Feishu bot starting in webhook mode (no websocket)")
+	} else {
+		logging.Default.Info("Feishu bot starting with WebSocket long connection")
+	}
 
-	// Start token refresh goroutine
+	// Start token refresh goroutine (used for outbound API calls)
 	go f.tokenRefreshLoop(ctx)
 
 	// Start message dedup cleanup
 	go f.cleanupProcessedMessages(ctx)
+
+	if !f.Config.UseWebhook {
+		dispatcher := larkdispatcher.NewEventDispatcher(
+			f.Config.VerificationToken,
+			f.Config.EncryptKey,
+		).OnP2MessageReceiveV1(func(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+			return f.handleMessageEventV1(ctx, event)
+		})
+
+		client := larkws.NewClient(
+			f.Config.AppID,
+			f.Config.AppSecret,
+			larkws.WithEventHandler(dispatcher),
+		)
+		f.wsClient = client
+
+		go func() {
+			if err := client.Start(ctx); err != nil {
+				logging.Default.Error("feishu ws client stopped: %v", err)
+			}
+		}()
+	}
 
 	// Keep running until context cancelled
 	<-ctx.Done()
@@ -91,6 +127,15 @@ func (f *FeishuChannel) Stop() error {
 func (f *FeishuChannel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 	if !f.Running {
 		return fmt.Errorf("feishu channel not running")
+	}
+
+	content := msg.Content
+	if suffix := formatUsageSuffix(msg.Metadata); suffix != "" {
+		if strings.TrimSpace(content) == "" {
+			content = suffix
+		} else {
+			content = content + "\n\n" + suffix
+		}
 	}
 
 	token, err := f.getTenantAccessToken(ctx)
@@ -115,11 +160,20 @@ func (f *FeishuChannel) Send(ctx context.Context, msg bus.OutboundMessage) error
 		}
 	}
 
-	// Send text content as interactive card
-	if msg.Content != "" {
-		card := f.buildCard(msg.Content)
-		if err := f.sendMessage(ctx, token, receiveIDType, msg.ChatID, "interactive", card); err != nil {
-			return fmt.Errorf("send message: %w", err)
+	// Send text content as interactive card (optional), fallback to plain text.
+	if content != "" {
+		if f.Config.UseCard {
+			card := f.buildCard(content)
+			if err := f.sendMessage(ctx, token, receiveIDType, msg.ChatID, "interactive", card); err != nil {
+				logging.Default.Warn("feishu card send failed, fallback to text: %v", err)
+				if err := f.sendMessage(ctx, token, receiveIDType, msg.ChatID, "text", map[string]string{"text": content}); err != nil {
+					return fmt.Errorf("send message: %w", err)
+				}
+			}
+		} else {
+			if err := f.sendMessage(ctx, token, receiveIDType, msg.ChatID, "text", map[string]string{"text": content}); err != nil {
+				return fmt.Errorf("send message: %w", err)
+			}
 		}
 	}
 
@@ -193,17 +247,32 @@ func (f *FeishuChannel) getTenantAccessToken(ctx context.Context) (string, error
 
 // sendMessage sends a message through Feishu API.
 func (f *FeishuChannel) sendMessage(ctx context.Context, token, receiveIDType, receiveID, msgType string, content interface{}) error {
-	contentJSON, _ := json.Marshal(content)
+	if strings.TrimSpace(receiveIDType) == "" {
+		receiveIDType = "open_id"
+	}
+	if strings.TrimSpace(receiveID) == "" {
+		return fmt.Errorf("receive_id is required")
+	}
+
+	normalized := content
+	if msgType == "interactive" {
+		if m, ok := content.(map[string]interface{}); ok {
+			if _, exists := m["card"]; !exists {
+				normalized = map[string]interface{}{"card": m}
+			}
+		}
+	}
+	contentJSON, _ := json.Marshal(normalized)
 
 	reqBody := map[string]interface{}{
-		"receive_id_type": receiveIDType,
-		"receive_id":      receiveID,
-		"msg_type":        msgType,
-		"content":         string(contentJSON),
+		"receive_id": receiveID,
+		"msg_type":   msgType,
+		"content":    string(contentJSON),
 	}
 	body, _ := json.Marshal(reqBody)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://open.feishu.cn/open-apis/im/v1/messages", bytes.NewReader(body))
+	endpoint := "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=" + url.QueryEscape(receiveIDType)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -359,18 +428,27 @@ func (f *FeishuChannel) buildCard(content string) map[string]interface{} {
 		"config": map[string]interface{}{
 			"wide_screen_mode": true,
 		},
+		"header": map[string]interface{}{
+			"title": map[string]interface{}{
+				"tag":     "plain_text",
+				"content": "lobster-go",
+			},
+		},
 		"elements": elements,
 	}
 }
 
 // buildCardElements splits content into card elements.
 func (f *FeishuChannel) buildCardElements(content string) []map[string]interface{} {
-	// Simple implementation: single markdown element
+	// Simple implementation: single markdown block
 	// TODO: Add table parsing like Python version
 	return []map[string]interface{}{
 		{
-			"tag":     "markdown",
-			"content": content,
+			"tag": "div",
+			"text": map[string]interface{}{
+				"tag":     "lark_md",
+				"content": content,
+			},
 		},
 	}
 }
@@ -403,6 +481,62 @@ func (f *FeishuChannel) HandleWebhookEvent(ctx context.Context, event json.RawMe
 	}
 
 	return nil
+}
+
+// handleMessageEventV1 processes a message receive event from WebSocket.
+func (f *FeishuChannel) handleMessageEventV1(ctx context.Context, event *larkim.P2MessageReceiveV1) error {
+	if event == nil || event.Event == nil || event.Event.Message == nil || event.Event.Sender == nil {
+		return nil
+	}
+
+	senderType := derefString(event.Event.Sender.SenderType)
+	if senderType != "" && senderType != "user" {
+		return nil
+	}
+
+	senderID := extractSenderID(event.Event.Sender)
+	if senderID == "" {
+		return nil
+	}
+
+	// Check permission
+	if !f.IsAllowed(f.Config.AllowFrom, senderID) {
+		logging.Default.Warn("access denied for sender %s", senderID)
+		return nil
+	}
+
+	msg := event.Event.Message
+	msgID := derefString(msg.MessageId)
+	if msgID != "" && f.isProcessed(msgID) {
+		return nil
+	}
+	if msgID != "" {
+		f.markProcessed(msgID)
+	}
+
+	msgType := derefString(msg.MessageType)
+	content := derefString(msg.Content)
+	chatID := derefString(msg.ChatId)
+	chatType := derefString(msg.ChatType)
+
+	text, media := f.parseMessageContent(msgType, content)
+	if text == "" && len(media) == 0 {
+		return nil
+	}
+
+	if emoji := f.reactionEmoji(); emoji != "" && msgID != "" {
+		go f.reactMessage(context.Background(), msgID, emoji)
+	}
+
+	if chatType == "p2p" {
+		chatID = senderID
+	}
+
+	return f.PublishInbound(ctx, senderID, chatID, text, media, map[string]string{
+		"message_id": msgID,
+		"chat_type":  chatType,
+		"msg_type":   msgType,
+	})
 }
 
 // handleMessageEvent processes a message receive event.
@@ -459,12 +593,209 @@ func (f *FeishuChannel) handleMessageEvent(ctx context.Context, eventData json.R
 		chatID = senderID
 	}
 
+	if emoji := f.reactionEmoji(); emoji != "" && msgID != "" {
+		go f.reactMessage(context.Background(), msgID, emoji)
+	}
+
 	// Publish to bus
 	return f.PublishInbound(ctx, senderID, chatID, content, media, map[string]string{
 		"message_id": msgID,
 		"chat_type":  evt.Message.ChatType,
 		"msg_type":   evt.Message.MessageType,
 	})
+}
+
+func (f *FeishuChannel) reactMessage(ctx context.Context, messageID, emojiType string) {
+	if strings.TrimSpace(messageID) == "" || strings.TrimSpace(emojiType) == "" {
+		return
+	}
+	logging.Default.Info("feishu react: message_id=%s emoji=%s", messageID, emojiType)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	token, err := f.getTenantAccessToken(ctx)
+	if err != nil {
+		logging.Default.Warn("feishu react get token failed: %v", err)
+		return
+	}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"reaction_type": map[string]interface{}{
+			"emoji_type": emojiType,
+		},
+	})
+	endpoint := fmt.Sprintf("https://open.feishu.cn/open-apis/im/v1/messages/%s/reactions", url.PathEscape(messageID))
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
+	if err != nil {
+		logging.Default.Warn("feishu react build request failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := f.httpClient.Do(req)
+	if err != nil {
+		logging.Default.Warn("feishu react request failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		logging.Default.Warn("feishu react decode failed: %v", err)
+		return
+	}
+	if result.Code != 0 {
+		logging.Default.Warn("feishu react error: code=%d msg=%s", result.Code, result.Msg)
+	}
+}
+
+func formatUsageSuffix(meta map[string]string) string {
+	if len(meta) == 0 {
+		return ""
+	}
+	tokens := strings.TrimSpace(meta["total_tokens"])
+	if tokens == "" {
+		prompt := strings.TrimSpace(meta["prompt_tokens"])
+		complete := strings.TrimSpace(meta["completion_tokens"])
+		if prompt != "" || complete != "" {
+			if prompt == "" {
+				prompt = "0"
+			}
+			if complete == "" {
+				complete = "0"
+			}
+			tokens = prompt + "+" + complete
+		}
+	}
+	cached := strings.TrimSpace(meta["cached_tokens"])
+	usetime := strings.TrimSpace(meta["latency_ms"])
+	if tokens == "" && usetime == "" {
+		return ""
+	}
+	if usetime != "" && !strings.HasSuffix(usetime, "ms") {
+		usetime = usetime + "ms"
+	}
+	if tokens == "" {
+		tokens = "-"
+	}
+	if cached == "" {
+		cached = "0"
+	}
+	netTokens := tokens
+	if total, err := strconv.Atoi(tokens); err == nil {
+		if hit, err := strconv.Atoi(cached); err == nil {
+			if hit < 0 {
+				hit = 0
+			}
+			if hit > total {
+				hit = total
+			}
+			netTokens = strconv.Itoa(total - hit)
+		}
+	}
+	if usetime == "" {
+		usetime = "-"
+	}
+	return "hit_cache_token:" + cached + " token:" + netTokens + " usetime:" + usetime
+}
+
+func (f *FeishuChannel) reactionEmoji() string {
+	return normalizeFeishuEmojiType(f.Config.ReactEmoji)
+}
+
+func derefString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func normalizeFeishuEmojiType(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "Get"
+	}
+	key := normalizeEmojiKey(raw)
+	if key == "" {
+		return "Get"
+	}
+	if val, ok := feishuEmojiTypeAliases[key]; ok {
+		return val
+	}
+	return raw
+}
+
+func normalizeEmojiKey(input string) string {
+	if input == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range input {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			b.WriteRune(unicode.ToLower(r))
+		}
+	}
+	return b.String()
+}
+
+var feishuEmojiTypeAliases = func() map[string]string {
+	types := []string{
+		"OK", "THUMBSUP", "THANKS", "MUSCLE", "FINGERHEART", "APPLAUSE",
+		"FISTBUMP", "JIAYI", "DONE", "SMILE", "BLUSH", "LAUGH",
+		"SMIRK", "LOL", "FACEPALM", "LOVE", "WINK", "PROUD",
+		"WITTY", "SMART", "SCOWL", "THINKING", "SOB", "CRY",
+		"ERROR", "NOSEPICK", "HAUGHTY", "SLAP", "SPITBLOOD", "TOASTED",
+		"BLACKFACE", "GLANCE", "DULL", "ROSE", "HEART", "PARTY",
+		"INNOCENTSMILE", "SHY", "CHUCKLE", "JOYFUL", "WOW", "TRICK",
+		"YEAH", "ENOUGH", "TEARS", "EMBARRASSED", "KISS", "SMOOCH",
+		"DROOL", "OBSESSED", "MONEY", "TEASE", "SHOWOFF", "COMFORT",
+		"CLAP", "PRAISE", "STRIVE", "XBLUSH", "SILENT", "WAVE",
+		"EATING", "WHAT", "FROWN", "DULLSTARE", "DIZZY", "LOOKDOWN",
+		"WAIL", "CRAZY", "WHIMPER", "HUG", "BLUBBER", "WRONGED",
+		"HUSKY", "SHHH", "SMUG", "ANGRY", "HAMMER", "SHOCKED",
+		"TERROR", "PETRIFIED", "SKULL", "SWEAT", "SPEECHLESS", "SLEEP",
+		"DROWSY", "YAWN", "SICK", "PUKE", "BIGKISS", "BETRAYED",
+		"HEADSET", "DONNOTGO", "EatingFood", "Typing", "Lemon", "Get",
+		"LGTM", "OnIt", "OneSecond", "Sigh", "MeMeMe", "VRHeadset",
+		"YouAreTheBest", "SALUTE", "SHAKE", "HIGHFIVE", "UPPERLEFT", "ThumbsDown",
+		"SLIGHT", "TONGUE", "EYESCLOSED", "BEAR", "BULL", "CALF",
+		"LIPS", "BEER", "CAKE", "GIFT", "CUCUMBER", "Drumstick",
+		"Pepper", "CANDIEDHAWS", "BubbleTea", "Coffee", "Yes", "No",
+		"OKR", "CheckMark", "CrossMark", "MinusOne", "Hundred", "AWESOMEN",
+		"Pin", "Alarm", "Loudspeaker", "Trophy", "Fire", "RAINBOWPUKE",
+		"Music", "XmasTree", "Snowman", "XmasHat", "FIREWORKS", "2022",
+		"RoarForYou", "REDPACKET", "FORTUNE", "LUCK", "FIRECRACKER", "StickyRiceBalls",
+		"HEARTBROKEN", "BOMB", "POOP", "18X", "CLEAVER", "Soccer",
+		"Basketball", "GeneralDoNotDisturb", "Status_PrivateMessage", "GeneralInMeetingBusy", "StatusReading", "StatusFlashOfInspiration",
+		"GeneralBusinessTrip", "GeneralWorkFromHome", "StatusEnjoyLife", "GeneralTravellingCar", "StatusBus", "StatusInFlight",
+		"GeneralSun", "GeneralMoonRest", "PursueUltimate", "CustomerSuccess", "Responsible", "Reliable",
+		"Ambitious", "Patient",
+	}
+	aliases := make(map[string]string, len(types))
+	for _, v := range types {
+		aliases[normalizeEmojiKey(v)] = v
+	}
+	return aliases
+}()
+
+func extractSenderID(sender *larkim.EventSender) string {
+	if sender == nil || sender.SenderId == nil {
+		return ""
+	}
+	if sender.SenderId.OpenId != nil && *sender.SenderId.OpenId != "" {
+		return *sender.SenderId.OpenId
+	}
+	if sender.SenderId.UserId != nil && *sender.SenderId.UserId != "" {
+		return *sender.SenderId.UserId
+	}
+	if sender.SenderId.UnionId != nil && *sender.SenderId.UnionId != "" {
+		return *sender.SenderId.UnionId
+	}
+	return ""
 }
 
 // parseMessageContent extracts text and media from message content.

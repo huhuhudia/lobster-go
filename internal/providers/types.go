@@ -32,13 +32,15 @@ type ChatMessage struct {
 
 // ChatRequest is the input to a provider chat call.
 type ChatRequest struct {
-	Messages        []ChatMessage
-	Tools           []ToolDefinition
-	Model           string
-	Temperature     float64
-	MaxTokens       int
-	ReasoningEffort string
-	Timeout         time.Duration
+	Messages             []ChatMessage
+	Tools                []ToolDefinition
+	Model                string
+	Temperature          float64
+	MaxTokens            int
+	ReasoningEffort      string
+	Timeout              time.Duration
+	PromptCacheKey       string
+	PromptCacheRetention string
 }
 
 // ToolDefinition describes a callable tool/function.
@@ -59,6 +61,7 @@ type Usage struct {
 	PromptTokens     int `json:"prompt_tokens,omitempty"`
 	CompletionTokens int `json:"completion_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens,omitempty"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
 }
 
 // Provider is the interface implemented by LLM backends.

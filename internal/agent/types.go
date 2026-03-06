@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -29,9 +30,13 @@ type LoopConfig struct {
 	BraveAPIKey            string
 	WebProxy               string
 	ExecTimeoutSec         int
+	LLMTimeoutSec          int
 	MemoryConsolidateEvery int
 	MemoryWindowSize       int
 	MemoryMode             string
+	PromptCacheKey         string
+	PromptCacheRetention   string
+	MaxHistoryMessages     int
 }
 
 // ContextBuilder builds prompts (placeholder; will be expanded).
@@ -63,8 +68,18 @@ func (r *ToolRegistry) Register(t Tool) { r.tools[t.Name()] = t }
 
 func (r *ToolRegistry) Definitions() []ToolDefinition {
 	defs := make([]ToolDefinition, 0, len(r.tools))
-	for _, t := range r.tools {
-		defs = append(defs, t.Definition())
+	if len(r.tools) == 0 {
+		return defs
+	}
+	names := make([]string, 0, len(r.tools))
+	for name := range r.tools {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if t, ok := r.tools[name]; ok {
+			defs = append(defs, t.Definition())
+		}
 	}
 	return defs
 }
@@ -148,7 +163,11 @@ func (l *AgentLoop) handleMessage(ctx context.Context, in bus.InboundMessage) {
 	}()
 	sess.AddMessage("user", in.Content)
 
-	messages := l.ctxBuilder.Build(sess, l.tools.Definitions())
+	promptSession := sess
+	if l.cfg.MaxHistoryMessages > 0 {
+		promptSession.Messages = sess.GetHistory(l.cfg.MaxHistoryMessages)
+	}
+	messages := l.ctxBuilder.Build(promptSession, l.tools.Definitions())
 	iter := 0
 	replied := false
 	for {
@@ -160,14 +179,23 @@ func (l *AgentLoop) handleMessage(ctx context.Context, in bus.InboundMessage) {
 			return
 		}
 		reqStart := time.Now()
+		timeoutSec := l.cfg.LLMTimeoutSec
+		if timeoutSec <= 0 {
+			timeoutSec = l.cfg.ExecTimeoutSec
+		}
+		if timeoutSec <= 0 {
+			timeoutSec = 120
+		}
 		req := providers.ChatRequest{
-			Messages:        messages,
-			Tools:           l.tools.Definitions(),
-			Model:           l.cfg.Model,
-			Temperature:     l.cfg.Temperature,
-			MaxTokens:       l.cfg.MaxTokens,
-			ReasoningEffort: l.cfg.ReasoningEffort,
-			Timeout:         time.Duration(l.cfg.ExecTimeoutSec) * time.Second,
+			Messages:             messages,
+			Tools:                l.tools.Definitions(),
+			Model:                l.cfg.Model,
+			Temperature:          l.cfg.Temperature,
+			MaxTokens:            l.cfg.MaxTokens,
+			ReasoningEffort:      l.cfg.ReasoningEffort,
+			Timeout:              time.Duration(timeoutSec) * time.Second,
+			PromptCacheKey:       buildPromptCacheKey(l.cfg.PromptCacheKey, sess.Key),
+			PromptCacheRetention: l.cfg.PromptCacheRetention,
 		}
 		if strings.TrimSpace(req.Model) == "" {
 			req.Model = l.provider.DefaultModel()
@@ -242,6 +270,7 @@ func (l *AgentLoop) handleMessage(ctx context.Context, in bus.InboundMessage) {
 			meta["prompt_tokens"] = fmt.Sprintf("%d", resp.Usage.PromptTokens)
 			meta["completion_tokens"] = fmt.Sprintf("%d", resp.Usage.CompletionTokens)
 			meta["total_tokens"] = fmt.Sprintf("%d", resp.Usage.TotalTokens)
+			meta["cached_tokens"] = fmt.Sprintf("%d", resp.Usage.CachedTokens)
 		}
 		_ = l.bus.PublishOutbound(bus.OutboundMessage{
 			Channel:  in.Channel,
@@ -337,4 +366,15 @@ func extractErrorCode(err error) string {
 		}
 	}
 	return code
+}
+
+func buildPromptCacheKey(cfgKey, sessionKey string) string {
+	key := strings.TrimSpace(cfgKey)
+	if key == "" {
+		return ""
+	}
+	if key == "session" {
+		return sessionKey
+	}
+	return key
 }

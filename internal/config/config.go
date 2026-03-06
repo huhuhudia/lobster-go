@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/huhuhudia/lobster-go/internal/channels"
 )
 
 // ProviderConfig defines a single LLM provider entry.
@@ -18,10 +20,14 @@ type ProviderConfig struct {
 
 // AgentDefaults holds default agent settings.
 type AgentDefaults struct {
-	Model       string  `json:"model,omitempty"`
-	Provider    string  `json:"provider,omitempty"`
-	Temperature float64 `json:"temperature,omitempty"`
-	MaxTokens   int     `json:"maxTokens,omitempty"`
+	Model                string  `json:"model,omitempty"`
+	Provider             string  `json:"provider,omitempty"`
+	Temperature          float64 `json:"temperature,omitempty"`
+	MaxTokens            int     `json:"maxTokens,omitempty"`
+	LLMTimeoutSec        int     `json:"llmTimeoutSec,omitempty"`
+	PromptCacheKey       string  `json:"promptCacheKey,omitempty"`
+	PromptCacheRetention string  `json:"promptCacheRetention,omitempty"`
+	MaxHistoryMessages   int     `json:"maxHistoryMessages,omitempty"`
 }
 
 // AgentsConfig groups default agent settings.
@@ -48,6 +54,12 @@ type MemoryConfig struct {
 	Mode             string `json:"mode,omitempty"`
 }
 
+// ChannelsConfig groups channel configurations.
+type ChannelsConfig struct {
+	Feishu channels.FeishuConfig `json:"feishu,omitempty"`
+	Mock   channels.MockConfig   `json:"mock,omitempty"`
+}
+
 // Config is the root configuration schema.
 type Config struct {
 	Providers map[string]ProviderConfig `json:"providers,omitempty"`
@@ -55,6 +67,7 @@ type Config struct {
 	Tools     ToolsConfig               `json:"tools"`
 	Services  ServicesConfig            `json:"services"`
 	Memory    MemoryConfig              `json:"memory"`
+	Channels  ChannelsConfig            `json:"channels,omitempty"`
 }
 
 // DefaultConfig returns a config populated with sensible defaults.
@@ -63,10 +76,12 @@ func DefaultConfig() Config {
 		Providers: map[string]ProviderConfig{},
 		Agents: AgentsConfig{
 			Defaults: AgentDefaults{
-				Model:       "",
-				Provider:    "",
-				Temperature: 0.1,
-				MaxTokens:   4096,
+				Model:              "",
+				Provider:           "",
+				Temperature:        0.1,
+				MaxTokens:          4096,
+				LLMTimeoutSec:      120,
+				MaxHistoryMessages: 50,
 			},
 		},
 		Tools: ToolsConfig{
@@ -81,6 +96,15 @@ func DefaultConfig() Config {
 			ConsolidateEvery: 20,
 			WindowSize:       50,
 			Mode:             "window",
+		},
+		Channels: ChannelsConfig{
+			Feishu: channels.FeishuConfig{
+				Enabled: false,
+				UseCard: false,
+			},
+			Mock: channels.MockConfig{
+				Enabled: false,
+			},
 		},
 	}
 }
